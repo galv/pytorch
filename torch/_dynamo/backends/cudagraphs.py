@@ -48,6 +48,13 @@ def find_input_mutations(g):
                 operator.le,  # runtime asserts
             ]:
                 continue
+            from torch._ops import HigherOrderOperator
+            # HigherOrderOperators don't have a _schema field. We pass
+            # over them right now, but that is probably not the right
+            # approach, given that nodes inside them could mutate
+            # inputs.
+            if isinstance(n.target, HigherOrderOperator):
+                continue
             schema = n.target._schema
             for i, arg in enumerate(schema.arguments):
                 if i < len(n.args):

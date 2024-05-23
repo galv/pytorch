@@ -455,6 +455,28 @@ class TestControlFlowTraced(TestCase):
         compiled_fn = torch.compile(fn, backend=backend)
         self.assertEqual(compiled_fn(*args), eager_res)
 
+    def _check_compile_cudagraph(self, fn, args):
+        eager_res = fn(*args)
+
+        # test eager mode stream capture
+        s = torch.cuda.Stream(args[0].device)
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                _ = fn(*args)
+        torch.cuda.current_stream().wait_stream(s)
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            eager_sc_res = fn(*args)
+        
+        g.replay()
+        self.assertEqual(eager_res, eager_sc_res)
+
+        # test cudagraphs backend
+        compiled_fn = torch.compile(fn, backend="cudagraphs")
+        self.assertEqual(eager_res, compiled_fn(*args))
+
     def test_cond_traced_not_nested(self):
         def true_fn(x):
             return x.sin()
@@ -475,6 +497,9 @@ class TestControlFlowTraced(TestCase):
 
         graph = make_fx(f, tracing_mode="symbolic")(x, torch.tensor(False))
         self.assertEqual(graph(x, torch.tensor(True)), f(x, torch.tensor(True)))
+
+        if torch.cuda.is_available():
+            self._check_compile_cudagraph(f, [x.cuda(), torch.tensor(True).cuda()])
 
     def test_while_loop_nested_traced(self):
         fn, inp = WHILE_LOOP_TESTS["nested"]
@@ -669,6 +694,20 @@ def forward(self, arg0_1):
     def test_while_loop_compile(self, backend, while_loop_test):
         fn, inp = WHILE_LOOP_TESTS[while_loop_test]
         self._check_compile(fn, inp, backend=backend)
+
+    @parametrize("while_loop_test", list(WHILE_LOOP_TESTS.keys()))
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA.")
+    def test_while_loop_cuda_stream_capture(self, while_loop_test):
+        fn, inp = WHILE_LOOP_TESTS[while_loop_test]
+
+        if isinstance(fn, torch.nn.Module):
+            fn.cuda()
+        inp = tuple(i.cuda() for i in inp)
+
+        self._check_compile_cudagraph(fn, inp)
+
+        if isinstance(fn, torch.nn.Module):
+            fn.cpu()
 
     @skipIfTorchDynamo("Graph is not captured by backend if test with dynamo")
     def test_while_loop_simple_with_linear_compile_check_graph(self):
@@ -875,6 +914,9 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1):
             f(x, torch.tensor(True), torch.tensor(True)),
         )
 
+        if torch.cuda.is_available():
+            self._check_compile_cudagraph(f, [x.cuda(), torch.tensor(True).cuda(), torch.tensor(True).cuda()])
+
     def test_cond_functionalized(self):
         def true_fn(x):
             y = x.sin()
@@ -887,6 +929,9 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1):
         def f(x):
             pred = x.shape[0] == 1
             return cond(pred, true_fn, false_fn, [x])
+        
+        def f_(x, y):
+            return cond(y, true_fn, false_fn, [x])
 
         example_inputs = (torch.ones(4, 5),)
         functional_f = torch.func.functionalize(f)
@@ -905,6 +950,10 @@ def forward(self, arg0_1, arg1_1, arg2_1, arg3_1):
         self.assertFalse(any(op._schema.is_mutable for op in all_ops_in_true_branch))
 
         self.assertEqual(graph_module(*example_inputs), f(*example_inputs))
+
+        if torch.cuda.is_available():
+            pred = torch.tensor(example_inputs[0].shape[0] == 1, device="cuda")
+            self._check_compile_cudagraph(f_, [torch.ones(4, 5).cuda(), pred])
 
     def test_cond_accepts_torch_function_as_inputs(self):
         a = torch.randn(3, 4)
@@ -1418,6 +1467,9 @@ def forward(self, arg0_1):
     mul = torch.ops.aten.mul.Tensor(arg0_1, arg0_1);  arg0_1 = None
     return (mul,)""",
         )
+
+        if torch.cuda.is_available():
+            self._check_compile_cudagraph(f, [x.cuda(), torch.tensor(False).cuda(), torch.tensor(False).cuda()])
 
     def test_raise_error_on_mismatch_type_size(self):
         def true_fn(x):
@@ -2712,6 +2764,109 @@ def forward(self, l_inp_, l_tmp_):
 
 
 instantiate_parametrized_tests(TestControlFlowTraced)
+
+class DynamicCondModel(torch.nn.Module):
+    def __init__(self, input_size=16, hidden_size=64, output_size=10):
+        super(DynamicCondModel, self).__init__()
+        self.fc1_0 = torch.nn.Linear(input_size, hidden_size)
+        self.fc1_1 = torch.nn.Linear(input_size, 32)
+        self.fc1_2 = torch.nn.Linear(32, hidden_size)
+        self.relu = torch.nn.ReLU()
+        self.fc2 = torch.nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        def true_fn(x):
+            return self.fc1_0(x)
+        
+        def false_fn(x):
+            x = self.fc1_1(x)
+            return self.fc1_2(x)
+        
+        # use PyTorch control flow API
+        pred = torch.tensor(x.sum() > 0, device="cuda")
+        x = cond(pred, true_fn, false_fn, [x])
+        
+        x = self.relu(x)
+        x = self.fc2(x)
+
+        return x
+
+class DynamicWhileNestedModel(torch.nn.Module):
+    def __init__(self, out_iter=5):
+        super(DynamicWhileNestedModel, self).__init__()
+        self.fc = torch.nn.Linear(2, 2)
+        self.relu = torch.nn.ReLU()
+        self.out_iter = out_iter
+        self.flag = torch.tensor(True, dtype=torch.bool, device="cuda")
+        self.idx = torch.zeros(1, dtype=torch.int64, device="cuda")
+        self.results = torch.zeros((5, 2, 2), device="cuda")
+
+    def forward(self, x, it):
+        def outer_cond_fn(it, x, idx):
+            return it.sum() < self.out_iter
+
+        def outer_body_fn(it, x, idx):
+            self.flag.fill_(True)
+            
+            def cond_fn(x, idx):
+                return torch.logical_or(x.sum() < 0, self.flag)
+                # return self.flag -> I doubt this a bug...
+                # this causes an issue in the "cudagraphs" backend
+                # error msg: torch._dynamo.exc.BackendCompilerFailed: backend='cudagraphs' raised:
+                # UnsupportedAliasMutationException: torch.while_loop's body_fn might be modifying the input!
+
+            def body_fn(x, idx):
+                x = self.fc(x)
+                x = self.relu(x)
+                self.results.index_copy_(0, idx, x.unsqueeze(0))
+                self.flag.fill_(x.sum() < 0)
+                return (x, idx + 1)
+        
+            (x, idx) = while_loop(cond_fn, body_fn, (x, idx))
+            return (it + 1, x, idx)
+
+        _ = while_loop(outer_cond_fn, outer_body_fn, (it, x, self.idx))
+
+        return self.results
+    
+class TestControlFlowNN(TestCase):
+    def _check_compile_cudagraph(self, fn, args):
+        eager_res = fn(*args)
+
+        # test eager mode stream capture
+        s = torch.cuda.Stream(args[0].device)
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                _ = fn(*args)
+        torch.cuda.current_stream().wait_stream(s)
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            eager_sc_res = fn(*args)
+        
+        g.replay()
+        self.assertEqual(eager_res, eager_sc_res)
+
+        # test cudagraphs backend
+        compiled_fn = torch.compile(fn, backend="cudagraphs")
+        self.assertEqual(eager_res, compiled_fn(*args))
+
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA.")
+    def test_cond_in_NN(self):
+        model = DynamicCondModel().cuda()
+
+        x = torch.randn(16, device="cuda")
+        self._check_compile_cudagraph(model, [x])
+
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA.")
+    def test_while_loop_in_NN(self):
+        model = DynamicWhileNestedModel().cuda()
+
+        x = torch.randn(2, 2, device="cuda")
+        y = torch.tensor(0, device="cuda")
+        self._check_compile_cudagraph(model, [x, y])
+
 
 if __name__ == "__main__":
     run_tests()
