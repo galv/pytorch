@@ -14,12 +14,12 @@ def _is_boolean_scalar_cuda_tensor(pred):
 
 @contextmanager
 def _if_body(pred: torch.Tensor):
-    cuda_graph = torch.cuda.CUDAGraph.get_currently_capturing_graph()
-    cuda_graph.begin_capture_to_if_node(pred)
+    current_cuda_graph = torch.cuda.CUDAGraph.get_currently_capturing_graph()
+    current_cuda_graph.begin_capture_to_if_node(pred)
     try:
         yield
     finally:
-        cuda_graph.end_capture_to_conditional_node()
+        current_cuda_graph.end_capture_to_conditional_node()
 
 def if_else_node(pred: torch.Tensor, true_fn, false_fn, operands):
     if not pred.is_cuda:
@@ -47,7 +47,7 @@ def _while_loop_body(pred: torch.Tensor):
     try:
         yield conditional_handle
     finally:
-        current_cuda_graph.end_capture_to_condtional_node(pred)
+        current_cuda_graph.end_capture_to_conditional_node()
 
 ### conditional node: while_loop
 def while_loop_node(cond_fn, body_fn, carried_inputs, additional_inputs):

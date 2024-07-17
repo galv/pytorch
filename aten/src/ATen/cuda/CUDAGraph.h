@@ -9,6 +9,13 @@
 
 #include <stack>
 
+#if defined(USE_ROCM) || !(defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
+// this type is not defined until CUDA 12.4, but we use it as a
+// parameter type and return type in some below functions, so we give
+// it the same definition as in CUDA 12.4.
+typedef unsigned long long cudaGraphConditionalHandle;
+#endif // defined(USE_ROCM) || !(defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
+
 namespace at {
 
 struct Generator;
@@ -124,11 +131,14 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   // captures if needed.
   int capture_dev_;
 
+  cudaStreamCaptureMode capture_mode_;
+
+#if !defined(USE_ROCM) && (defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
   std::stack<at::cuda::CUDAStreamGuard> conditional_node_streams_;
   std::stack<CaptureId_t> conditional_graph_capture_streams_ids_;
   std::stack<cudaGraphConditionalHandle> conditional_handles_;
   std::vector<cudaGraph_t> descendent_graphs_;
-  cudaStreamCaptureMode capture_mode_;
+#endif // !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12040
 };
 
 } // namespace cuda
