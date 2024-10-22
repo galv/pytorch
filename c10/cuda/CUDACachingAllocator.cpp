@@ -1011,6 +1011,13 @@ static std::string reportProcessMemoryInfo(c10::DeviceIndex device) {
 
 namespace Native {
 
+struct GraphCapture {
+  MempoolId_t mempool_id;
+  c10::DeviceIndex device;
+  std::function<bool(cudaStream_t)> stream_filter;
+  std::optional<std::function<void(void*, size_t)>> allocation_logger{};
+};
+
 class DeviceCachingAllocator {
  private:
   // lock around all operations
@@ -1033,8 +1040,7 @@ class DeviceCachingAllocator {
   // allocations to a specific pool.
   // Most of the time it's empty, in which case malloc can avoid calling
   // cudaStreamGetCaptureInfo in the hot path.
-  std::vector<std::pair<MempoolId_t, std::function<bool(cudaStream_t)>>>
-      captures_underway;
+  std::vector<GraphCapture> captures_underway;
 
   // See free() for this thing's purpose
   std::vector<Block*> needs_events_deferred_until_no_capture;
@@ -1344,8 +1350,19 @@ class DeviceCachingAllocator {
     }
 
     bool split_remainder = should_split(params.block, params.size());
-    return alloc_found_block(
+    Block* block = alloc_found_block(
         params, orig_size, std::move(context), split_remainder);
+
+    if (C10_UNLIKELY(!captures_underway.empty())) {
+      for (auto& it : captures_underway) {
+        auto logger = it.allocation_logger;
+        if (logger && it.stream_filter(stream)) {
+          (*logger)(block->ptr, orig_size);
+        }
+      }
+    }
+
+    return block;
   }
 
   Block* alloc_found_block(
@@ -2020,7 +2037,8 @@ class DeviceCachingAllocator {
   // Called by CUDAGraph::capture_begin
   void beginAllocateToPool(
       MempoolId_t mempool_id,
-      std::function<bool(cudaStream_t)> filter) {
+      std::function<bool(cudaStream_t)> filter,
+      std::optional<std::function<void(void*, size_t)>> allocation_logger) {
     std::lock_guard<std::recursive_mutex> lock(mutex);
     auto it = graph_pools.find(mempool_id);
     if (it == graph_pools.end()) {
@@ -2037,10 +2055,14 @@ class DeviceCachingAllocator {
     for (auto it2 = captures_underway.begin(); it2 != captures_underway.end();
          ++it2) {
       TORCH_CHECK(
-          it2->first != mempool_id,
+          it2->mempool_id != mempool_id,
           "beginAllocateToPool: already recording to mempool_id");
     }
-    captures_underway.emplace_back(mempool_id, std::move(filter));
+    captures_underway.emplace_back(GraphCapture{
+      .mempool_id = mempool_id,
+      .stream_filter = std::move(filter),
+      .allocation_logger = std::move(allocation_logger),
+    });
   }
 
   // Called by CUDAGraph::capture_end
@@ -2048,7 +2070,7 @@ class DeviceCachingAllocator {
     std::lock_guard<std::recursive_mutex> lock(mutex);
     for (auto it = captures_underway.begin(); it != captures_underway.end();
          ++it) {
-      if (it->first == mempool_id) {
+      if (it->mempool_id == mempool_id) {
         captures_underway.erase(it);
         return;
       }
@@ -2429,8 +2451,8 @@ class DeviceCachingAllocator {
     // cudaStreamCaptureStatus (which does a TLS lookup).
     if (C10_UNLIKELY(!captures_underway.empty())) {
       for (auto& entry : captures_underway) {
-        if (entry.second(stream)) {
-          auto it1 = graph_pools.find(entry.first);
+        if (entry.stream_filter(stream)) {
+          auto it1 = graph_pools.find(entry.mempool_id);
           TORCH_INTERNAL_ASSERT(it1 != graph_pools.end());
           if (size <= kSmallSize) {
             return it1->second->small_blocks;
@@ -3537,10 +3559,11 @@ class NativeCachingAllocator : public CUDAAllocator {
   void beginAllocateToPool(
       c10::DeviceIndex device,
       MempoolId_t mempool_id,
-      std::function<bool(cudaStream_t)> filter) override {
+      std::function<bool(cudaStream_t)> filter,
+      std::optional<std::function<void(void*, size_t)>> allocation_logger = std::nullopt) override {
     assertValidDevice(device);
     device_allocator[device]->beginAllocateToPool(
-        std::move(mempool_id), std::move(filter));
+        std::move(mempool_id), std::move(filter), std::move(allocation_logger));
   }
 
   void endAllocateToPool(c10::DeviceIndex device, MempoolId_t mempool_id)

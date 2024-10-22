@@ -85,8 +85,10 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
 
   // Will this graph have dynamic input/output tensors?
   bool dynamic_graph_;
-  // (if dynamic) Which allocations are dynamic?
+  // (if dynamic) Which allocations made during graph capture are dynamic?
   std::vector<DynamicGraphAllocation> allocations_;
+  // (if dynamic) Which tensors are dynamic (whether input or output)?
+  std::vector<DynamicGraphAllocation> dynamic_tensors_;
   // (if dynamic) Which parameters of which kernels need to be updated to the input tensors or new allocations?
   std::vector<DynamicGraphKernelParamUpdate> kernel_param_updates_;
   // (if dynamic) Some Torch ops use cudaMemcpyAsync or cudaMemsetAsync, those also need to have their pointers updated
