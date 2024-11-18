@@ -27,7 +27,13 @@ cudaStream_t create_external_stream() {
   // Be sure to call cudaStreamDestroy on this when it is finished
   // being used.
   cudaStream_t child_stream;
-  AT_CUDA_CHECK(cudaStreamCreate(&child_stream));
+  // we use cudaStreamNonBlocking because every default cuda stream in
+  // pytorch uses that flag for all streams used for stream capture
+  // (see kDefaultFlags in CUDAStream.cpp). This would need to be kept
+  // in sync, should that ever change. Or kDefaultFlags needs to be
+  // exposed in a header file.
+  AT_CUDA_CHECK(
+      cudaStreamCreateWithFlags(&child_stream, cudaStreamNonBlocking));
   return child_stream;
 }
 } // anonymous namespace
@@ -55,7 +61,7 @@ constexpr int kSynchronizeBusyWaitMillis = 10;
 // which cudaStreamBeginCapture{,ToGraph}() was called.
 // See:
 // https://docs.nvidia.com/cuda/cuda-c-programming-guide/#cross-stream-dependencies-and-events
-static thread_local CUDAGraph* _currently_capturing_graph;
+static thread_local std::stack<CUDAGraph*> _currently_capturing_graphs;
 
 MempoolId_t graph_pool_handle() {
   // Sets just the second value, to distinguish it from MempoolId_ts created from
@@ -127,7 +133,7 @@ void CUDAGraph::capture_begin(MempoolId_t pool/*={0,0}*/, cudaStreamCaptureMode 
 
   capture_mode_ = capture_mode;
 
-  _currently_capturing_graph = this;
+  _currently_capturing_graphs.push(this);
 
   // default generator is always registered
   auto* gen = get_generator_or_default<CUDAGeneratorImpl>(
@@ -196,10 +202,11 @@ void CUDAGraph::capture_end() {
 
   AT_CUDA_CHECK(cudaStreamEndCapture(capture_stream_, &graph_));
 
-  TORCH_CHECK(_currently_capturing_graph != nullptr,
-              "capture_end() called before capture_begin().");
+  TORCH_CHECK(
+      !_currently_capturing_graphs.empty(),
+      "capture_end() called before capture_begin().");
 
-  _currently_capturing_graph = nullptr;
+  _currently_capturing_graphs.pop();
 
   c10::cuda::CUDACachingAllocator::endAllocateToPool(capture_dev_, mempool_id_);
 
@@ -374,9 +381,9 @@ CUDAGraph::~CUDAGraph() {
 
 CUDAGraph* CUDAGraph::get_currently_capturing_graph() {
   TORCH_CHECK(
-      _currently_capturing_graph != nullptr,
+      !_currently_capturing_graphs.empty(),
       "get_currently_capturing_graph() can be used only between capture_begin() and capture_end()");
-  return _currently_capturing_graph;
+  return _currently_capturing_graphs.top();
 }
 
 void CUDAGraph::begin_capture_to_if_node(

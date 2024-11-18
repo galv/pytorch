@@ -198,7 +198,7 @@ def cond(
             if metadata_mode:
                 backend = make_eager_backend_with_torch_function_mode(metadata_mode)
             else:
-                backend = "eager"
+                backend = "eager_warmup_conditional_nodes"
             return torch.compile(_cond_op_wrapper, backend=backend, fullgraph=True)(
                 pred, true_fn, false_fn, operands
             )
@@ -371,7 +371,7 @@ def cond_op_dense(pred, true_fn, false_fn, operands):
     ), f"Dense implementation operands must be a list of tensors and ints {operands}"
     mode = _get_current_dispatch_mode()
     assert mode is None, "Mode should never be enabled for CPU/CUDA key"
-    if not torch.cuda.is_current_stream_capturing():
+    if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
         if pred:
             return true_fn(*operands)
         else:

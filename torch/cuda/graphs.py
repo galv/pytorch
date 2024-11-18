@@ -1,6 +1,9 @@
 # mypy: allow-untyped-defs
+from contextlib import contextmanager
+import ctypes
 import gc
 import typing
+import weakref
 
 import torch
 
@@ -132,6 +135,11 @@ class graph:
             may be unsafe. "global" will error on actions in other threads, "thread_local" will only error for
             actions in the current thread, and "relaxed" will not error on actions. Do NOT change this setting
             unless you're familiar with `cudaStreamCaptureMode <https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html#group__CUDART__STREAM_1g9d0535d93a214cbf126835257b16ba85>`_
+        collect_garbage (bool, optional): If True, call torch.cuda.synchronize() followed by gc.collect() to free
+            memory before starting graph capture. Users almost always this to be True, but since the introduction of
+            conditional nodes in cuda graphs, it is possible that more than one stream may be capturing at once.
+            Since cudaDeviceSynchronize() synchronizes all streams, including capturing streams, previously started
+            stream captures will be invalidated. This is not desirable.
 
     .. note::
         For effective memory sharing, if you pass a ``pool`` used by a previous capture and the previous capture
@@ -145,6 +153,8 @@ class graph:
     """  # noqa: B950
 
     default_capture_stream: typing.Optional["torch.cuda.Stream"] = None
+    # Unsure about type here
+    raw_default_capture_stream: typing.Optional["torch.cuda.cudart().cudaStream_t"] = None
 
     def __init__(
         self,
@@ -152,12 +162,27 @@ class graph:
         pool=None,
         stream=None,
         capture_error_mode: str = "global",
+        collect_garbage: bool = True,
     ):
         # Lazy-init of default_capture_stream helps avoid circular-import errors.
-        # Not thread safe, but graphs already have the general (explicitly documented)
-        # restriction that only one capture may be underway at a time in the process.
         if self.__class__.default_capture_stream is None:
-            self.__class__.default_capture_stream = torch.cuda.Stream()
+            # We use an external stream to prevent the rare situation
+            # of a stream that is already in used being grabbed from
+            # the stream pool. This requires destroying the external
+            # stream's raw stream appropriately, which we do via
+            # weakref.finalize. Ideally we would create a new external
+            # stream for every __enter__, which is then destroyed on
+            # __exit__, but that technically will break the interface
+            # in case anyone is accessing graph.default_capture_stream
+            cudart = torch.cuda.cudart()
+            stream = ctypes.c_ulonglong(0)
+            stream_p = ctypes.POINTER(ctypes.c_void_p)(stream)
+            stream_p_int = ctypes.cast(stream_p, ctypes.c_void_p).value
+            out = cudart.cudaStreamCreate(stream_p_int)
+            assert out == 0
+            assert stream.value != 0
+            self.__class__.default_capture_stream = torch.cuda.ExternalStream(stream.value)
+            self.__class__.raw_default_capture_stream = stream
 
         self.pool = () if pool is None else (pool,)
         self.capture_stream = (
@@ -167,12 +192,14 @@ class graph:
         self.stream_ctx = torch.cuda.stream(self.capture_stream)
         self.cuda_graph = cuda_graph
         self.capture_error_mode = capture_error_mode
+        self.collect_garbage = collect_garbage
 
     def __enter__(self):
-        # Free as much memory as we can for the graph
-        torch.cuda.synchronize()
-        gc.collect()
-        torch.cuda.empty_cache()
+        # Free as much memory as we can for the graph.
+        if self.collect_garbage:
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
 
         # Stackoverflow seems comfortable with this pattern
         # https://stackoverflow.com/questions/26635684/calling-enter-and-exit-manually#39172487
@@ -186,6 +213,9 @@ class graph:
         self.cuda_graph.capture_end()
         self.stream_ctx.__exit__(exc_type, exc_value, traceback)
         # returning None should propagate exceptions from either capture_end or stream_ctx.__exit__()
+
+
+weakref.finalize(graph, lambda cls: torch.cuda.cudart().cudaStreamDestroy(cls.raw_default_capture_stream) if cls.raw_default_capture_stream is not None else None)
 
 
 def make_graphed_callables(
@@ -488,3 +518,13 @@ def make_graphed_callables(
         return ret[0]
 
     return tuple(ret)
+
+# TODO: Add .pyi file entry
+@contextmanager
+def thread_cuda_stream_capture_mode(new_mode):
+    cudart = torch.cuda.cudart()
+    old_mode = cudart.cudaThreadExchangeStreamCaptureMode(new_mode)
+    try:
+        yield
+    finally:
+        cudart.cudaThreadExchangeStreamCaptureMode(old_mode)
