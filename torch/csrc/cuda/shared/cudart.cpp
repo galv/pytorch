@@ -102,6 +102,7 @@ void initCudartBindings(PyObject* module) {
       "cuda"
       "StreamCreateWithFlags",
       [](uintptr_t ptr, unsigned int flags) -> cudaError_t {
+        // NOLINTNEXTLINE(performance-no-int-to-ptr)
         return C10_CUDA_ERROR_HANDLED(
             cudaStreamCreateWithFlags((cudaStream_t*)ptr, flags));
       });

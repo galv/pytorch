@@ -1,9 +1,9 @@
 # mypy: allow-untyped-defs
-from contextlib import contextmanager
 import ctypes
 import gc
 import typing
 import weakref
+from contextlib import contextmanager
 
 import torch
 
@@ -153,8 +153,6 @@ class graph:
     """  # noqa: B950
 
     default_capture_stream: typing.Optional["torch.cuda.Stream"] = None
-    # Unsure about type here
-    raw_default_capture_stream: typing.Optional["torch.cuda.cudart().cudaStream_t"] = None
 
     def __init__(
         self,
@@ -181,8 +179,17 @@ class graph:
             out = cudart.cudaStreamCreate(stream_p_int)
             assert out == 0
             assert stream.value != 0
-            self.__class__.default_capture_stream = torch.cuda.ExternalStream(stream.value)
-            self.__class__.raw_default_capture_stream = stream
+            self.__class__.default_capture_stream = torch.cuda.ExternalStream(
+                stream.value
+            )
+
+            weakref.finalize(
+                self.__class__,
+                lambda stream_p_int: torch.cuda.cudart().cudaStreamDestroy(
+                    stream_p_int
+                ),
+                stream_p_int,
+            )
 
         self.pool = () if pool is None else (pool,)
         self.capture_stream = (
@@ -213,9 +220,6 @@ class graph:
         self.cuda_graph.capture_end()
         self.stream_ctx.__exit__(exc_type, exc_value, traceback)
         # returning None should propagate exceptions from either capture_end or stream_ctx.__exit__()
-
-
-weakref.finalize(graph, lambda cls: torch.cuda.cudart().cudaStreamDestroy(cls.raw_default_capture_stream) if cls.raw_default_capture_stream is not None else None)
 
 
 def make_graphed_callables(
@@ -518,6 +522,7 @@ def make_graphed_callables(
         return ret[0]
 
     return tuple(ret)
+
 
 # TODO: Add .pyi file entry
 @contextmanager

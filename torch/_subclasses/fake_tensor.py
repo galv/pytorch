@@ -2650,7 +2650,10 @@ def run_fallback_kernel(
                 return out
             return e
 
-        has_cuda_tensor = any(isinstance(a, FakeTensor) and a.fake_device.type == "cuda" for a in flat_args)
+        has_cuda_tensor = any(
+            isinstance(a, FakeTensor) and a.fake_device.type == "cuda"
+            for a in flat_args
+        )
 
         flat_args = [to_real_tensor(a) for a in flat_args]
         args, kwargs = pytree.tree_unflatten(flat_args, args_spec)
@@ -2664,12 +2667,13 @@ def run_fallback_kernel(
         # in this case. This is basically always safe because the
         # unsafe actions tend to be lazy initialization of things like
         # CUFFT plans, which won't be destroyed.
+        maybe_relaxed: typing.ContextManager = contextlib.nullcontext()
         if has_cuda_tensor:
             cudart = torch.cuda.cudart()
-            manager = thread_cuda_stream_capture_mode(cudart.cudaStreamCaptureMode.Relaxed)
-        else:
-            manager = contextlib.nullcontext()
-        with manager:
+            maybe_relaxed = thread_cuda_stream_capture_mode(
+                cudart.cudaStreamCaptureMode.Relaxed
+            )
+        with maybe_relaxed:
             r = func(*args, **kwargs)
 
     storages: Set[_StoragePointer] = set()

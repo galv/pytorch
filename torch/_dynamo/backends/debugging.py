@@ -9,9 +9,9 @@ from typing import Any, List, Optional
 import torch
 from functorch.compile import min_cut_rematerialization_partition
 from torch import _guards
-from torch.utils._python_dispatch import TorchDispatchMode
 from torch._functorch import config as functorch_config
 from torch._functorch.compilers import ts_compile
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from .common import aot_autograd
 from .registry import register_debug_backend as register_backend
@@ -31,12 +31,14 @@ def eager(gm, fake_tensor_inputs, **kwargs):
         log.warning("eager backend ignoring extra kwargs %s", kwargs)
     return gm.forward
 
+
 @register_backend
 def eager_warmup_conditional_nodes(gm, fake_tensor_inputs):
     s = torch.cuda.Stream()
     with ControlFlowOpWarmupDispatchMode(s):
         gm.forward(*fake_tensor_inputs)
     return gm.forward
+
 
 class ControlFlowOpWarmupDispatchMode(TorchDispatchMode):
     def __init__(self, stream):
@@ -47,12 +49,16 @@ class ControlFlowOpWarmupDispatchMode(TorchDispatchMode):
 
     def __enter__(self):
         self.throw_away_graph = torch.cuda.CUDAGraph()
-        self.graph_ctx = torch.cuda.graph(self.throw_away_graph,
-                                          stream=self.stream,
-                                          capture_error_mode='relaxed',
-                                          collect_garbage=False)
+        self.graph_ctx = torch.cuda.graph(
+            self.throw_away_graph,
+            stream=self.stream,
+            capture_error_mode="relaxed",
+            collect_garbage=False,
+        )
         cudart = torch.cuda.cudart()
-        self.original_capture_mode = cudart.cudaThreadExchangeStreamCaptureMode(cudart.cudaStreamCaptureModeRelaxed)
+        self.original_capture_mode = cudart.cudaThreadExchangeStreamCaptureMode(
+            cudart.cudaStreamCaptureModeRelaxed
+        )
         self.graph_ctx.__enter__()
         return super().__enter__()
 
@@ -71,13 +77,16 @@ class ControlFlowOpWarmupDispatchMode(TorchDispatchMode):
         del self.graph_ctx
         del self.throw_away_graph
         cudart = torch.cuda.cudart()
-        previous_capture_mode = cudart.cudaThreadExchangeStreamCaptureMode(self.original_capture_mode)
+        previous_capture_mode = cudart.cudaThreadExchangeStreamCaptureMode(
+            self.original_capture_mode
+        )
         assert previous_capture_mode == cudart.cudaStreamCaptureModeRelaxed
         super().__exit__(exc_type, exc_val, exc_tb)
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = {} if kwargs is None else kwargs
         return func(*args, **kwargs)
+
 
 def make_eager_backend_with_torch_function_mode(mode):
     return make_eager_backend_with_torch_function_modes([mode])
