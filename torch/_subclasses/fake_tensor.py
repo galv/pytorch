@@ -2659,14 +2659,14 @@ def run_fallback_kernel(
         args, kwargs = pytree.tree_unflatten(flat_args, args_spec)
 
         # If one of the inputs is a CUDA tensor, it is possible that
-        # running the work will do an unsafe action. Unfortunately,
-        # there are scenarios where pytorch can have a stream
-        # currently capturing on the current stream that is using fake
-        # tensors (in particular, for shape inference in higher order
-        # operators). We need to prevent stream capture from breaking
-        # in this case. This is basically always safe because the
-        # unsafe actions tend to be lazy initialization of things like
-        # CUFFT plans, which won't be destroyed.
+        # running the fallback kernel will do an unsafe
+        # action. Unfortunately, there are scenarios where pytorch can
+        # have a stream currently capturing on the current stream that
+        # is using fake tensors (in particular, for shape inference in
+        # higher order operators). We need to prevent stream capture
+        # from breaking in this case. This is basically always safe
+        # because the unsafe actions tend to be lazy initialization of
+        # things like CUFFT plans, which won't be destroyed.
         maybe_relaxed: typing.ContextManager = contextlib.nullcontext()
         if has_cuda_tensor:
             cudart = torch.cuda.cudart()

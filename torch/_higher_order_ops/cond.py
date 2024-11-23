@@ -18,7 +18,10 @@ from torch._C._functorch import (
 from torch._dispatch.python import suspend_functionalization
 from torch._functorch.utils import exposed_in
 from torch._guards import detect_fake_mode
-from torch._higher_order_ops.cudagraph_conditional_nodes import if_else_node
+from torch._higher_order_ops.cudagraph_conditional_nodes import (
+    ControlFlowOpWarmupDispatchMode,
+    if_else_node,
+)
 from torch._higher_order_ops.utils import (
     _has_potential_branch_input_alias,
     _has_potential_branch_input_mutation,
@@ -197,8 +200,10 @@ def cond(
         with _temp_remove_metadata_torch_function_mode() as metadata_mode:
             if metadata_mode:
                 backend = make_eager_backend_with_torch_function_mode(metadata_mode)
-            else:
+            elif torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
                 backend = "eager_warmup_conditional_nodes"
+            else:
+                backend = "eager"
             return torch.compile(_cond_op_wrapper, backend=backend, fullgraph=True)(
                 pred, true_fn, false_fn, operands
             )
@@ -378,6 +383,13 @@ def cond_op_dense(pred, true_fn, false_fn, operands):
             return false_fn(*operands)
     else:
         return if_else_node(pred, true_fn, false_fn, operands)
+
+
+# WAR for https://github.com/pytorch/pytorch/issues/140322
+@cond_op.py_impl(ControlFlowOpWarmupDispatchMode)
+def cond_op_warmup(mode, pred, true_fn, false_fn, operands):
+    assert torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+    return if_else_node(pred, true_fn, false_fn, operands)
 
 
 class CondAutogradOp(torch.autograd.Function):

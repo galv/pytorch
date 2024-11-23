@@ -117,6 +117,28 @@ class CUDAGraph(torch._C._CUDAGraph):
         return super().debug_dump(debug_path)
 
 
+def create_external_stream():
+    # We use an external stream to prevent the rare situation of a
+    # stream that is already in use being grabbed from the stream
+    # pool. We need to manually destroy the external stream's raw
+    # stream once the external stream is garbage collected, which we
+    # do via weakref.finalize.
+    cudart = torch.cuda.cudart()
+    stream = ctypes.c_ulonglong(0)
+    stream_p = ctypes.pointer(stream)
+    stream_p_int = ctypes.cast(stream_p, ctypes.c_void_p).value
+    out = cudart.cudaStreamCreateWithFlags(stream_p_int, cudart.cudaStreamNonBlocking)
+    assert out == 0
+    assert stream.value != 0
+    external_stream = torch.cuda.ExternalStream(stream.value)
+    weakref.finalize(
+        external_stream,
+        torch.cuda.cudart().cudaStreamDestroy,
+        stream.value,
+    )
+    return external_stream
+
+
 class graph:
     r"""Context-manager that captures CUDA work into a :class:`torch.cuda.CUDAGraph` object for later replay.
 
@@ -164,32 +186,13 @@ class graph:
     ):
         # Lazy-init of default_capture_stream helps avoid circular-import errors.
         if self.__class__.default_capture_stream is None:
-            # We use an external stream to prevent the rare situation
-            # of a stream that is already in used being grabbed from
-            # the stream pool. This requires destroying the external
-            # stream's raw stream appropriately, which we do via
-            # weakref.finalize. Ideally we would create a new external
-            # stream for every __enter__, which is then destroyed on
-            # __exit__, but that technically will break the interface
-            # in case anyone is accessing graph.default_capture_stream
-            cudart = torch.cuda.cudart()
-            stream = ctypes.c_ulonglong(0)
-            stream_p = ctypes.POINTER(ctypes.c_void_p)(stream)
-            stream_p_int = ctypes.cast(stream_p, ctypes.c_void_p).value
-            out = cudart.cudaStreamCreate(stream_p_int)
-            assert out == 0
-            assert stream.value != 0
-            self.__class__.default_capture_stream = torch.cuda.ExternalStream(
-                stream.value
-            )
+            # Ideally we would create a new external stream for every
+            # __enter__, which is then destroyed on __exit__, but that
+            # technically will break the interface in case any user is
+            # accessing graph.default_capture_stream.
+            self.__class__.default_capture_stream = create_external_stream()
 
-            weakref.finalize(
-                self.__class__,
-                lambda stream_p_int: torch.cuda.cudart().cudaStreamDestroy(
-                    stream_p_int
-                ),
-                stream_p_int,
-            )
+            # from torch._dynamo._variables import torch_function
 
         self.pool = () if pool is None else (pool,)
         self.capture_stream = (

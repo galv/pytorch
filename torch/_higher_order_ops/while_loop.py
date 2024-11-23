@@ -4,6 +4,10 @@ from typing import Callable, Tuple, Union
 import torch
 import torch.utils._pytree as pytree
 from torch._C import DispatchKey
+from torch._higher_order_ops.cudagraph_conditional_nodes import (
+    ControlFlowOpWarmupDispatchMode,
+    while_loop_node,
+)
 from torch._higher_order_ops.utils import (
     _has_potential_branch_input_alias,
     _has_potential_branch_input_mutation,
@@ -21,7 +25,7 @@ from torch.fx.experimental.proxy_tensor import (
     ProxyTorchDispatchMode,
     track_tensor_tree,
 )
-from torch._higher_order_ops.cudagraph_conditional_nodes import while_loop_node
+
 
 class WhileLoopOp(HigherOrderOperator):
     def __init__(self) -> None:
@@ -158,6 +162,11 @@ def while_loop(cond_fn, body_fn, carried_inputs):
             with _temp_remove_metadata_torch_function_mode() as metadata_mode:
                 if metadata_mode:
                     backend = make_eager_backend_with_torch_function_mode(metadata_mode)
+                elif (
+                    torch.cuda.is_available()
+                    and torch.cuda.is_current_stream_capturing()
+                ):
+                    backend = "eager_warmup_conditional_nodes"
                 else:
                     backend = "eager"
                 return torch.compile(
@@ -181,7 +190,7 @@ def while_loop_dense(cond_fn, body_fn, carried_inputs, additional_inputs):
             f"carried_inputs must be a tuple but got {type(carried_inputs)}"
         )
 
-    if not torch.cuda.is_current_stream_capturing():
+    if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
         while pred := cond_fn(*carried_vals, *additional_inputs):
             if not _is_boolean_scalar_tensor(pred):
                 raise RuntimeError(
@@ -198,6 +207,13 @@ def while_loop_dense(cond_fn, body_fn, carried_inputs, additional_inputs):
         return carried_vals
     else:
         return while_loop_node(cond_fn, body_fn, carried_inputs, additional_inputs)
+
+
+# WAR for https://github.com/pytorch/pytorch/issues/140322
+@while_loop_op.py_impl(ControlFlowOpWarmupDispatchMode)
+def while_loop_warmup(mode, cond_fn, body_fn, carried_inputs, additional_inputs):
+    assert torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+    return while_loop_node(cond_fn, body_fn, carried_inputs, additional_inputs)
 
 
 while_loop_op.py_impl(DispatchKey.Autograd)(

@@ -33,8 +33,8 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   ~CUDAGraph();
 
   // Copy and move constructors and assignments are disabled. These
-  // were added late in CUDAGraph's existence because pybind11
-  // believed that CUDAGraph was copy constructable because
+  // were disabled because pybind11 believed that CUDAGraph was copy
+  // constructable because
   // pybind11::is_copy_constructible<CUDAGraph>::value originally
   // evaluated to true. However, it cannot generate a copy constructor
   // because CUDAGeneratorState, one of CUDAGraph's members, is an

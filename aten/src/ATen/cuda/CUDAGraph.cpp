@@ -43,15 +43,10 @@ constexpr int kSynchronizeBusyWaitMillis = 10;
 
 // N.B.: Using a thread-local variable to reference the currently
 // capturing graph won't work if pytorch ever does stream capture
-// across multiple host CPU threads. While CUDA allows for this, I'm
-// not aware of this happening anywhere among pytorch users. I doubt
-// that anyone is doing this right now because, capture sequences'
-// capture modes are associated with host threads, not with streams,
-// and a host thread will default to GLOBAL capture mode, not the
-// capture mode you specified buding cudaStreamBeginCapture(). (For
-// example, ProcessGroupNCCL will avoid enqueueing work for the
-// watchdog thread when current stream is capturing.)
-
+// across multiple host CPU threads. While CUDA allows for this,
+// pytorch never allowed for this (see
+// https://github.com/pytorch/pytorch/blob/e46af7de0c978cbfd99bf8540f3ec6470490523e/torch/cuda/graphs.py#L157)
+// .
 // If we did want to support stream capture across multiple threads,
 // we could implement this as a global hashmap mapping CUDAStream
 // objects to CUDAGraph objects. We would need to update this mapping
@@ -61,7 +56,8 @@ constexpr int kSynchronizeBusyWaitMillis = 10;
 // which cudaStreamBeginCapture{,ToGraph}() was called.
 // See:
 // https://docs.nvidia.com/cuda/cuda-c-programming-guide/#cross-stream-dependencies-and-events
-static thread_local std::stack<CUDAGraph*> _currently_capturing_graphs;
+static std::mutex _currently_capturing_graphs_mutex;
+static ska::flat_hash_map<CaptureId_t, CUDAGraph*> _currently_capturing_graphs;
 
 MempoolId_t graph_pool_handle() {
   // Sets just the second value, to distinguish it from MempoolId_ts created from
@@ -133,8 +129,6 @@ void CUDAGraph::capture_begin(MempoolId_t pool/*={0,0}*/, cudaStreamCaptureMode 
 
   capture_mode_ = capture_mode;
 
-  _currently_capturing_graphs.push(this);
-
   // default generator is always registered
   auto* gen = get_generator_or_default<CUDAGeneratorImpl>(
       std::nullopt, cuda::detail::getDefaultCUDAGenerator());
@@ -192,6 +186,10 @@ void CUDAGraph::capture_begin(MempoolId_t pool/*={0,0}*/, cudaStreamCaptureMode 
   AT_CUDA_CHECK(cudaStreamGetCaptureInfo(stream, &status, &capture_id_));
   TORCH_INTERNAL_ASSERT(status == cudaStreamCaptureStatus::cudaStreamCaptureStatusActive);
 
+  {
+    std::unique_lock<std::mutex> lock(_currently_capturing_graphs_mutex);
+    _currently_capturing_graphs.emplace(capture_id_, this);
+  }
 }
 
 void CUDAGraph::capture_end() {
@@ -202,11 +200,13 @@ void CUDAGraph::capture_end() {
 
   AT_CUDA_CHECK(cudaStreamEndCapture(capture_stream_, &graph_));
 
-  TORCH_CHECK(
-      !_currently_capturing_graphs.empty(),
-      "capture_end() called before capture_begin().");
-
-  _currently_capturing_graphs.pop();
+  {
+    std::unique_lock<std::mutex> lock(_currently_capturing_graphs_mutex);
+    TORCH_CHECK(
+        _currently_capturing_graphs.count(capture_id_),
+        "capture_end() called before capture_begin().");
+    _currently_capturing_graphs.erase(capture_id_);
+  }
 
   c10::cuda::CUDACachingAllocator::endAllocateToPool(capture_dev_, mempool_id_);
 
@@ -380,10 +380,18 @@ CUDAGraph::~CUDAGraph() {
 }
 
 CUDAGraph* CUDAGraph::get_currently_capturing_graph() {
+  std::unique_lock<std::mutex> lock(_currently_capturing_graphs_mutex);
+  cudaStreamCaptureStatus status{};
+  CaptureId_t current_capture_id = -1;
+  auto stream = at::cuda::getCurrentCUDAStream();
+  AT_CUDA_CHECK(cudaStreamGetCaptureInfo(stream, &status, &current_capture_id));
   TORCH_CHECK(
-      !_currently_capturing_graphs.empty(),
-      "get_currently_capturing_graph() can be used only between capture_begin() and capture_end()");
-  return _currently_capturing_graphs.top();
+      status == cudaStreamCaptureStatus::cudaStreamCaptureStatusActive,
+      "The current stream is not currently capturing.");
+  TORCH_CHECK(
+      _currently_capturing_graphs.count(current_capture_id),
+      "get_currently_capturing_graph() can be used only between capture_begin() and capture_end(). Did you use a stream without making it depend upon the original stream used for capture?");
+  return _currently_capturing_graphs.at(current_capture_id);
 }
 
 void CUDAGraph::begin_capture_to_if_node(
@@ -451,6 +459,13 @@ void CUDAGraph::begin_capture_to_if_node(
 
   conditional_node_streams_.emplace(getStreamFromExternal(
       child_stream, getCurrentCUDAStream().device_index()));
+
+  {
+    std::unique_lock<std::mutex> lock(_currently_capturing_graphs_mutex);
+    _currently_capturing_graphs.emplace(
+        conditional_graph_capture_streams_ids_.top(), this);
+  }
+
 #else // !defined(USE_ROCM) && (defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
   AT_ERROR(
       __func__,
@@ -526,6 +541,12 @@ cudaGraphConditionalHandle CUDAGraph::begin_capture_to_while_loop_node(
   conditional_node_streams_.emplace(getStreamFromExternal(
       child_stream, getCurrentCUDAStream().device_index()));
 
+  {
+    std::unique_lock<std::mutex> lock(_currently_capturing_graphs_mutex);
+    _currently_capturing_graphs.emplace(
+        conditional_graph_capture_streams_ids_.top(), this);
+  }
+
   return handle;
 #else // !defined(USE_ROCM) && (defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
   AT_ERROR(
@@ -537,6 +558,15 @@ cudaGraphConditionalHandle CUDAGraph::begin_capture_to_while_loop_node(
 
 void CUDAGraph::end_capture_to_conditional_node() {
 #if !defined(USE_ROCM) && (defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
+  {
+    std::unique_lock<std::mutex> lock(_currently_capturing_graphs_mutex);
+    CaptureId_t capture_id = conditional_graph_capture_streams_ids_.top();
+    TORCH_CHECK(
+        _currently_capturing_graphs.count(capture_id),
+        "capture_end() called before capture_begin().");
+    _currently_capturing_graphs.erase(capture_id);
+  }
+
   CUDAStream stream = conditional_node_streams_.top().current_stream();
   conditional_node_streams_.pop();
   cudaGraph_t graph;
