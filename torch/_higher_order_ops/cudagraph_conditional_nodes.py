@@ -17,6 +17,7 @@ class ControlFlowOpWarmupDispatchMode(TorchDispatchMode):
         self.throw_away_graph: Optional[torch.cuda.CUDAGraph] = None
         self.graph_ctx: Optional[torch.cuda.graph] = None
         self.original_capture_mode = None
+        self.autograd_multithreading_disabled = None
 
     def __enter__(self) -> Self:
         self.throw_away_graph = torch.cuda.CUDAGraph()
@@ -34,6 +35,10 @@ class ControlFlowOpWarmupDispatchMode(TorchDispatchMode):
             cudart.cudaStreamCaptureMode.Relaxed
         )
         self.graph_ctx.__enter__()
+        self.autograd_multithreading_disabled = (
+            torch.autograd.grad_mode.set_multithreading_enabled(False)
+        )
+        self.autograd_multithreading_disabled.__enter__()
         super().__enter__()
         return self
 
@@ -44,6 +49,7 @@ class ControlFlowOpWarmupDispatchMode(TorchDispatchMode):
         exc_tb,
     ) -> None:
         super().__exit__(exc_type, exc_val, exc_tb)
+        self.autograd_multithreading_disabled.__exit__(exc_type, exc_val, exc_tb)
         assert self.graph_ctx is not None
         self.graph_ctx.__exit__(exc_type, exc_val, exc_tb)
         # The destructor of self.throw_away_graph calls

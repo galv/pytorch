@@ -241,10 +241,10 @@ def create_fw_bw_graph_branches(true_fn, false_fn, *operands):
             # Once in the forward path (as it should) and once in the backward path, where it shouldn't be called
             # If we can get rid of the second invokation, it would simplify this function
             fw_true_graph, joint_true_graph = create_fw_bw_graph(
-                true_fn, False, fw_inputs, fw_outputs_true
+                true_fn, False, fw_inputs, fw_outputs_true, materialize_grads=True
             )
             fw_false_graph, joint_false_graph = create_fw_bw_graph(
-                false_fn, False, fw_inputs, fw_outputs_false
+                false_fn, False, fw_inputs, fw_outputs_false, materialize_grads=True
             )
 
         return fw_true_graph, fw_false_graph, joint_true_graph, joint_false_graph

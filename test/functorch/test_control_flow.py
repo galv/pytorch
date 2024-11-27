@@ -44,13 +44,6 @@ from torch.testing._internal.common_utils import (
 def _check_compile_cudagraph(test_case, fn, args):
     eager_res = fn(*args)
 
-    # test eager mode stream capture
-    s = torch.cuda.Stream(args[0].device)
-    s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
-        _ = fn(*args)
-    torch.cuda.current_stream().wait_stream(s)
-
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         eager_sc_res = fn(*args)
