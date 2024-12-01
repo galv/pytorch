@@ -7,8 +7,6 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 
-# I need to somehow use this in the backward pass as well. How? Could
-# be quite easy actually...
 class ControlFlowOpWarmupDispatchMode(TorchDispatchMode):
     def __init__(
         self,
