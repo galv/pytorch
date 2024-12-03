@@ -163,11 +163,6 @@ def while_loop(cond_fn, body_fn, carried_inputs):
             with _temp_remove_metadata_torch_function_mode() as metadata_mode:
                 if metadata_mode:
                     backend = make_eager_backend_with_torch_function_mode(metadata_mode)
-                elif (
-                    torch.cuda.is_available()
-                    and torch.cuda.is_current_stream_capturing()
-                ):
-                    backend = "eager_warmup_conditional_nodes"
                 else:
                     backend = "eager"
                 return torch.compile(
