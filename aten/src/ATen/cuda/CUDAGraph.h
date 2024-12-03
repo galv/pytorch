@@ -39,7 +39,7 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   // evaluated to true. However, it cannot generate a copy constructor
   // because CUDAGeneratorState, one of CUDAGraph's members, is an
   // incomplete type unless CUDAGeneratorImpl.h is included. However,
-  // That would create a circular dependency between
+  // that would create a circular dependency between
   // CUDAGeneratorImpl.h and CUDAGraph.h. Disabling the copy and move
   // constructors is the most straightforward way to prevent pybind11
   // from trying to generate default implementations of them.

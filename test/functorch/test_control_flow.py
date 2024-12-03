@@ -41,6 +41,9 @@ from torch.testing._internal.common_utils import (
 )
 
 
+# todo: figure out if random number generation works as expected
+
+
 def _check_compile_cudagraph(test_case, fn, args):
     eager_res = fn(*args)
 

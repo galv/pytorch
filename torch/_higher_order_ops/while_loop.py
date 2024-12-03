@@ -6,6 +6,7 @@ import torch.utils._pytree as pytree
 from torch._C import DispatchKey
 from torch._higher_order_ops.cudagraph_conditional_nodes import (
     ControlFlowOpWarmupDispatchMode,
+    CUDAGraphCaptureControlFlowOpDispatchMode,
     while_loop_node,
 )
 from torch._higher_order_ops.utils import (
@@ -190,23 +191,39 @@ def while_loop_dense(cond_fn, body_fn, carried_inputs, additional_inputs):
             f"carried_inputs must be a tuple but got {type(carried_inputs)}"
         )
 
-    if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
-        while pred := cond_fn(*carried_vals, *additional_inputs):
-            if not _is_boolean_scalar_tensor(pred):
-                raise RuntimeError(
-                    f"cond_fn must return a boolean scalar tensor but got {pred}"
-                )
-            out = body_fn(*carried_vals, *additional_inputs)
-            assert isinstance(
-                out, tuple
-            ), f"body_fn should return a tuple but got {type(out)}"
-            assert len(out) == len(
-                carried_inputs
-            ), "body_fn should return the same number of elements as carried_inputs"
-            carried_vals = out
-        return carried_vals
-    else:
-        return while_loop_node(cond_fn, body_fn, carried_inputs, additional_inputs)
+    while pred := cond_fn(*carried_vals, *additional_inputs):
+        if not _is_boolean_scalar_tensor(pred):
+            raise RuntimeError(
+                f"cond_fn must return a boolean scalar tensor but got {pred}"
+            )
+        out = body_fn(*carried_vals, *additional_inputs)
+        assert isinstance(
+            out, tuple
+        ), f"body_fn should return a tuple but got {type(out)}"
+        assert len(out) == len(
+            carried_inputs
+        ), "body_fn should return the same number of elements as carried_inputs"
+        carried_vals = out
+    return carried_vals
+
+
+# WAR for https://github.com/pytorch/pytorch/issues/140322
+@while_loop_op.py_impl(CUDAGraphCaptureControlFlowOpDispatchMode)
+def cond_op_cudagraph(mode, cond_fn, body_fn, carried_inputs, additional_inputs):
+    if not mode.inside_already_warmed_up_op:
+        for fn in (cond_fn, body_fn):
+            if fn not in mode.warmed_up_control_flow_ops:
+                warmup_mode = ControlFlowOpWarmupDispatchMode()
+                with warmup_mode:
+                    fn(*carried_inputs, *additional_inputs)
+                mode.warmed_up_control_flow_ops.add(fn)
+    mode.inside_already_warmed_up_op = True
+    # Re-enter this mode in order to handle nested control flow
+    # operations
+    with mode:
+        output = while_loop_node(cond_fn, body_fn, carried_inputs, additional_inputs)
+    mode.inside_already_warmed_up_op = False
+    return output
 
 
 # WAR for https://github.com/pytorch/pytorch/issues/140322

@@ -5,6 +5,23 @@ from typing_extensions import Self
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._pytree import tree_iter
+
+
+class CUDAGraphCaptureControlFlowOpDispatchMode(TorchDispatchMode):
+    def __init__(self):
+        self.warmed_up_control_flow_ops = set()
+        self.inside_already_warmed_up_op = False
+
+    def __torch_dispatch__(
+        self,
+        func,
+        types,
+        args=(),
+        kwargs=None,
+    ):
+        kwargs = {} if kwargs is None else kwargs
+        return func(*args, **kwargs)
 
 
 class ControlFlowOpWarmupDispatchMode(TorchDispatchMode):
@@ -14,10 +31,6 @@ class ControlFlowOpWarmupDispatchMode(TorchDispatchMode):
         self.stream = torch.cuda.graphs.create_external_stream()
         self.throw_away_graph: Optional[torch.cuda.CUDAGraph] = None
         self.graph_ctx: Optional[torch.cuda.graph] = None
-        self.original_capture_mode = None
-        self.autograd_multithreading_disabled: Optional[
-            torch.autograd.grad_mode.set_multithreading_enabled
-        ] = None
 
     def __enter__(self) -> Self:
         self.throw_away_graph = torch.cuda.CUDAGraph()
@@ -30,15 +43,7 @@ class ControlFlowOpWarmupDispatchMode(TorchDispatchMode):
             capture_error_mode="relaxed",
             collect_garbage=False,
         )
-        cudart = torch.cuda.cudart()
-        self.original_capture_mode = cudart.cudaThreadExchangeStreamCaptureMode(
-            cudart.cudaStreamCaptureMode.Relaxed
-        )
         self.graph_ctx.__enter__()
-        self.autograd_multithreading_disabled = (
-            torch.autograd.grad_mode.set_multithreading_enabled(False)
-        )
-        self.autograd_multithreading_disabled.__enter__()
         super().__enter__()
         return self
 
@@ -49,27 +54,23 @@ class ControlFlowOpWarmupDispatchMode(TorchDispatchMode):
         exc_tb,
     ) -> None:
         super().__exit__(exc_type, exc_val, exc_tb)
-        assert self.autograd_multithreading_disabled is not None
-        self.autograd_multithreading_disabled.__exit__(exc_type, exc_val, exc_tb)
         assert self.graph_ctx is not None
-        self.graph_ctx.__exit__(exc_type, exc_val, exc_tb)
-        # The destructor of self.throw_away_graph calls
-        # cudaGraphExecDestroy(), which is an unsafe call for any
-        # other streams that are currently capturing to a graph. To
-        # prevent invalidating other capturing streams, this thread
-        # must remain in relaxed stream capture mode when the
-        # destructor runs. Therefore, we manually delete
-        # self.throw_away_graph (and self.graph_ctx, which has a
-        # strong reference to it) now rather than letting them be
-        # automatically destroyed when this
-        # ControlFlowOpWarmupDispatchMode instance is deleted.
-        del self.graph_ctx
-        del self.throw_away_graph
-        cudart = torch.cuda.cudart()
-        previous_capture_mode = cudart.cudaThreadExchangeStreamCaptureMode(
-            self.original_capture_mode
-        )
-        assert previous_capture_mode == cudart.cudaStreamCaptureMode.Relaxed
+        with torch.cuda.graphs.thread_cuda_stream_capture_mode(
+            torch.cuda.cudart().cudaStreamCaptureMode.Relaxed
+        ):
+            self.graph_ctx.__exit__(exc_type, exc_val, exc_tb)
+            # The destructor of self.throw_away_graph calls
+            # cudaGraphExecDestroy(), which is an unsafe call for any
+            # other streams that are currently capturing to a graph. To
+            # prevent invalidating other capturing streams, this thread
+            # must remain in relaxed stream capture mode when the
+            # destructor runs. Therefore, we manually delete
+            # self.throw_away_graph (and self.graph_ctx, which has a
+            # strong reference to it) now rather than letting them be
+            # automatically destroyed when this
+            # ControlFlowOpWarmupDispatchMode instance is deleted.
+            del self.graph_ctx
+            del self.throw_away_graph
 
     def __torch_dispatch__(
         self,
@@ -79,7 +80,10 @@ class ControlFlowOpWarmupDispatchMode(TorchDispatchMode):
         kwargs=None,
     ):
         kwargs = {} if kwargs is None else kwargs
-        return func(*args, **kwargs)
+        with torch.cuda.graphs.thread_cuda_stream_capture_mode(
+            torch.cuda.cudart().cudaStreamCaptureMode.Relaxed
+        ):
+            return func(*args, **kwargs)
 
 
 def _is_boolean_scalar_cuda_tensor(pred: Any) -> bool:
@@ -120,7 +124,7 @@ def if_else_node(pred: torch.Tensor, true_fn, false_fn, operands):
             # tensors into the same tensor... Is there an obvious way to do
             # that?
             if len(outs) == 2:
-                for if_out, else_out in zip(outs[0], outs[1]):
+                for if_out, else_out in zip(tree_iter(outs[0]), tree_iter(outs[1])):
                     if_out.copy_(else_out)
     assert len(outs) == 2
     return outs[0]

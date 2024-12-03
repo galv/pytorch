@@ -11,7 +11,6 @@ from functorch.compile import min_cut_rematerialization_partition
 from torch import _guards
 from torch._functorch import config as functorch_config
 from torch._functorch.compilers import ts_compile
-from torch._higher_order_ops.cond import ControlFlowOpWarmupDispatchMode
 
 from .common import aot_autograd
 from .registry import register_debug_backend as register_backend
@@ -29,15 +28,6 @@ This file contains TorchDynamo backends intended for debugging uses.
 def eager(gm, fake_tensor_inputs, **kwargs):
     if kwargs:
         log.warning("eager backend ignoring extra kwargs %s", kwargs)
-    return gm.forward
-
-
-@register_backend
-def eager_warmup_conditional_nodes(gm, fake_tensor_inputs):
-    # No need for warmup unless running under CUDA.
-    if torch.cuda.is_available():
-        with ControlFlowOpWarmupDispatchMode():
-            gm.forward(*fake_tensor_inputs)
     return gm.forward
 
 

@@ -203,6 +203,11 @@ class graph:
         self.cuda_graph = cuda_graph
         self.capture_error_mode = capture_error_mode
         self.collect_garbage = collect_garbage
+        from torch._higher_order_ops.cudagraph_conditional_nodes import (
+            CUDAGraphCaptureControlFlowOpDispatchMode,
+        )
+
+        self.control_flow_op_dispatch_mode = CUDAGraphCaptureControlFlowOpDispatchMode()
 
     def __enter__(self):
         # Free as much memory as we can for the graph.
@@ -214,6 +219,7 @@ class graph:
         # Stackoverflow seems comfortable with this pattern
         # https://stackoverflow.com/questions/26635684/calling-enter-and-exit-manually#39172487
         self.stream_ctx.__enter__()
+        self.control_flow_op_dispatch_mode.__enter__()
 
         self.cuda_graph.capture_begin(
             *self.pool, capture_error_mode=self.capture_error_mode
@@ -221,6 +227,7 @@ class graph:
 
     def __exit__(self, exc_type, exc_value, traceback):
         self.cuda_graph.capture_end()
+        self.control_flow_op_dispatch_mode.__exit__(exc_type, exc_value, traceback)
         self.stream_ctx.__exit__(exc_type, exc_value, traceback)
         # returning None should propagate exceptions from either capture_end or stream_ctx.__exit__()
 
@@ -527,7 +534,6 @@ def make_graphed_callables(
     return tuple(ret)
 
 
-# TODO: Add .pyi file entry
 @contextmanager
 def thread_cuda_stream_capture_mode(new_mode):
     cudart = torch.cuda.cudart()

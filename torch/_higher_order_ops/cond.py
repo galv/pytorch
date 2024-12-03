@@ -20,6 +20,7 @@ from torch._functorch.utils import exposed_in
 from torch._guards import detect_fake_mode
 from torch._higher_order_ops.cudagraph_conditional_nodes import (
     ControlFlowOpWarmupDispatchMode,
+    CUDAGraphCaptureControlFlowOpDispatchMode,
     if_else_node,
 )
 from torch._higher_order_ops.utils import (
@@ -200,8 +201,6 @@ def cond(
         with _temp_remove_metadata_torch_function_mode() as metadata_mode:
             if metadata_mode:
                 backend = make_eager_backend_with_torch_function_mode(metadata_mode)
-            elif torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-                backend = "eager_warmup_conditional_nodes"
             else:
                 backend = "eager"
             return torch.compile(_cond_op_wrapper, backend=backend, fullgraph=True)(
@@ -376,13 +375,30 @@ def cond_op_dense(pred, true_fn, false_fn, operands):
     ), f"Dense implementation operands must be a list of tensors and ints {operands}"
     mode = _get_current_dispatch_mode()
     assert mode is None, "Mode should never be enabled for CPU/CUDA key"
-    if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
-        if pred:
-            return true_fn(*operands)
-        else:
-            return false_fn(*operands)
+    if pred:
+        return true_fn(*operands)
     else:
-        return if_else_node(pred, true_fn, false_fn, operands)
+        return false_fn(*operands)
+
+
+# WAR for https://github.com/pytorch/pytorch/issues/140322
+@cond_op.py_impl(CUDAGraphCaptureControlFlowOpDispatchMode)
+def cond_op_cudagraph(mode, pred, true_fn, false_fn, operands):
+    assert torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+    if not mode.inside_already_warmed_up_op:
+        for fn in (true_fn, false_fn):
+            if fn not in mode.warmed_up_control_flow_ops:
+                warmup_mode = ControlFlowOpWarmupDispatchMode()
+                with warmup_mode:
+                    fn(*operands)
+                mode.warmed_up_control_flow_ops.add(fn)
+    mode.inside_already_warmed_up_op = True
+    # Re-enter this mode in order to handle nested control flow
+    # operations
+    with mode:
+        output = if_else_node(pred, true_fn, false_fn, operands)
+    mode.inside_already_warmed_up_op = False
+    return output
 
 
 # WAR for https://github.com/pytorch/pytorch/issues/140322

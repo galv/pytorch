@@ -41,21 +41,11 @@ cudaStream_t create_external_stream() {
 static bool _cuda_graphs_debug = false;
 constexpr int kSynchronizeBusyWaitMillis = 10;
 
-// N.B.: Using a thread-local variable to reference the currently
-// capturing graph won't work if pytorch ever does stream capture
-// across multiple host CPU threads. While CUDA allows for this,
-// pytorch never allowed for this (see
-// https://github.com/pytorch/pytorch/blob/e46af7de0c978cbfd99bf8540f3ec6470490523e/torch/cuda/graphs.py#L157)
-// .
-// If we did want to support stream capture across multiple threads,
-// we could implement this as a global hashmap mapping CUDAStream
-// objects to CUDAGraph objects. We would need to update this mapping
-// any time someone uses torch.cuda.Stream.wait_stream or
-// torch.cuda.Stream.wait_event, since waiting on an event is the only
-// way to put a stream into capture mode other than the stream on
-// which cudaStreamBeginCapture{,ToGraph}() was called.
-// See:
-// https://docs.nvidia.com/cuda/cuda-c-programming-guide/#cross-stream-dependencies-and-events
+// To support stream capture across multiple threads, we use a global
+// hashmap mapping cuda stream capture IDs to CUDAGraph objects. This
+// was originally a thread_local std::stack<CUDAGraph*>, but that was
+// not acceptable since stream capture does span threads in certain
+// circumstances (in particular, during autograd).
 static std::mutex _currently_capturing_graphs_mutex;
 static ska::flat_hash_map<CaptureId_t, CUDAGraph*> _currently_capturing_graphs;
 
