@@ -240,7 +240,9 @@ def _while_loop_tests():
                     return i2.clone(), j2 - 1, x2 + 3.14, y2 - 2.71
 
                 i1, j1, x1, y1 = while_loop(
-                    cond_fn_nested, body_fn_nested, (i1, j1, x1, y1) # is this list a problem?
+                    cond_fn_nested,
+                    body_fn_nested,
+                    (i1, j1, x1, y1),
                 )
                 return i1 - 1, j1.clone(), x1 * 2, y1 / 2
 
