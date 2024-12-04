@@ -215,7 +215,7 @@ def preserve_global_state(fn: Callable[_P, _T]) -> Callable[_P, _T]:
             prior_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
             py_rng_state = random.getstate()
             torch_rng_state = torch.random.get_rng_state()
-            cuda_rng_state = None
+            cuda_rng_state: Optional[Union[torch.Tensor, torch._C.Generator]] = None
             if torch.cuda.is_available():
                 if not torch.cuda.is_current_stream_capturing():
                     cuda_rng_state = torch.cuda.get_rng_state()
@@ -261,8 +261,10 @@ def preserve_global_state(fn: Callable[_P, _T]) -> Callable[_P, _T]:
                 torch.random.set_rng_state(torch_rng_state)
                 if cuda_rng_state is not None:
                     if not torch.cuda.is_current_stream_capturing():
+                        assert isinstance(cuda_rng_state, torch.Tensor)
                         torch.cuda.set_rng_state(cuda_rng_state)
                     else:
+                        assert isinstance(cuda_rng_state, torch._C.Generator)
                         torch.cuda.default_generators[
                             torch.cuda.current_device()
                         ].graphsafe_set_state(cuda_rng_state)

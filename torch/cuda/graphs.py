@@ -1,9 +1,9 @@
 # mypy: allow-untyped-defs
+import contextlib
 import ctypes
 import gc
 import typing
 import weakref
-from contextlib import contextmanager
 
 import torch
 
@@ -534,7 +534,7 @@ def make_graphed_callables(
     return tuple(ret)
 
 
-@contextmanager
+@contextlib.contextmanager
 def thread_cuda_stream_capture_mode(new_mode):
     cudart = torch.cuda.cudart()
     old_mode = cudart.cudaThreadExchangeStreamCaptureMode(new_mode)

@@ -4,8 +4,8 @@ from typing import Any, Generator, Optional
 from typing_extensions import Self
 
 import torch
-from torch.utils._python_dispatch import TorchDispatchMode
 import torch.utils._pytree as pytree
+from torch.utils._python_dispatch import TorchDispatchMode
 
 
 class CUDAGraphCaptureControlFlowOpDispatchMode(TorchDispatchMode):
@@ -124,7 +124,9 @@ def if_else_node(pred: torch.Tensor, true_fn, false_fn, operands):
             # tensors into the same tensor... Is there an obvious way to do
             # that?
             if len(outs) == 2:
-                for if_out, else_out in zip(pytree.tree_iter(outs[0]), pytree.tree_iter(outs[1])):
+                for if_out, else_out in zip(
+                    pytree.tree_iter(outs[0]), pytree.tree_iter(outs[1])
+                ):
                     if_out.copy_(else_out)
     assert len(outs) == 2
     return outs[0]
