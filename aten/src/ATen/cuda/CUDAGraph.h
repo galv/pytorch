@@ -7,6 +7,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include <c10/util/flat_hash_map.h>
 
+#include <limits>
 #include <stack>
 
 #if defined(USE_ROCM) || !(defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
@@ -100,7 +101,7 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
 
   // the ID assigned by cuda during graph capture,
   // used to identify when a stream is participating in capture
-  CaptureId_t capture_id_ = -1;
+  CaptureId_t capture_id_ = std::numeric_limits<CaptureId_t>::max();
 
   // uuid used to request a particular private mempool from CUDACachingAllocator.
   // By default, this will be set to {id_, 0}.
