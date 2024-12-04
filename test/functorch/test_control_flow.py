@@ -3816,7 +3816,7 @@ def forward(self, arg0_1):
         if isinstance(fn, torch.nn.Module):
             fn = copy.deepcopy(fn)
             fn.cuda()
-        inp = tuple(i.cuda() for i in inp)
+        inp = pytree.tree_map(lambda x: x.cuda(), inp)
 
         _check_compile_cudagraph(self, fn, inp)
 

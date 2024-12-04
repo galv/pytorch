@@ -5,7 +5,7 @@ from typing_extensions import Self
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
-from torch.utils._pytree import tree_iter
+import torch.utils._pytree as pytree
 
 
 class CUDAGraphCaptureControlFlowOpDispatchMode(TorchDispatchMode):
@@ -124,7 +124,7 @@ def if_else_node(pred: torch.Tensor, true_fn, false_fn, operands):
             # tensors into the same tensor... Is there an obvious way to do
             # that?
             if len(outs) == 2:
-                for if_out, else_out in zip(tree_iter(outs[0]), tree_iter(outs[1])):
+                for if_out, else_out in zip(pytree.tree_iter(outs[0]), pytree.tree_iter(outs[1])):
                     if_out.copy_(else_out)
     assert len(outs) == 2
     return outs[0]
@@ -141,11 +141,6 @@ def _while_loop_body(pred: torch.Tensor) -> Generator[int, None, None]:
 
 
 def while_loop_node(cond_fn, body_fn, carried_inputs, additional_inputs):
-    if not isinstance(carried_inputs, tuple):
-        raise RuntimeError(
-            f"carried_inputs must be a tuple but got {type(carried_inputs)}"
-        )
-
     carried_vals = carried_inputs
     pred = cond_fn(*carried_vals, *additional_inputs)
     if not _is_boolean_scalar_cuda_tensor(pred):
@@ -155,17 +150,17 @@ def while_loop_node(cond_fn, body_fn, carried_inputs, additional_inputs):
 
     with _while_loop_body(pred) as conditional_handle:
         out = body_fn(*carried_vals, *additional_inputs)
-        assert isinstance(
-            out, tuple
-        ), f"body_fn should return a tuple but got {type(out)}"
-        assert len(out) == len(
+        out_flat, out_spec = pytree.tree_flatten(out)
+        assert len(out_flat) == len(
             carried_inputs
         ), "body_fn should return the same number of elements as carried_inputs"
 
-        for c, o in zip(carried_vals, out):
+        for c, o in zip(carried_vals, out_flat):
+            # TODO: Consider skipping the copy_ if the data_ptr is the
+            # same.
             c.copy_(o)
 
-        # call the cond_fn again to update the pred
+        # call the cond_fn again to update the pred.
         pred = cond_fn(*carried_vals, *additional_inputs)
         if not _is_boolean_scalar_cuda_tensor(pred):
             raise RuntimeError(
@@ -173,4 +168,4 @@ def while_loop_node(cond_fn, body_fn, carried_inputs, additional_inputs):
             )
         torch.cuda.CUDAGraph.set_conditional_handle(conditional_handle, pred)
 
-    return carried_vals
+    return pytree.tree_unflatten(carried_vals, out_spec)
