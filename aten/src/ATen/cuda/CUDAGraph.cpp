@@ -11,8 +11,15 @@
 
 namespace at::cuda {
 
+void external_stream_deleter(cudaStream_t* stream) {
+  if (stream != nullptr) {
+    cudaStreamDestroy(*stream);
+    delete stream;
+  }
+}
+
 namespace {
-cudaStream_t create_external_stream() {
+UniquePtrExternalCudaStream create_external_stream() {
   // From:
   // https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html#group__CUDART__STREAM_1g793d7d4e474388ddfda531603dc34aa3
   // "Capture must be ended on the same stream in which it was initiated, and it
@@ -24,17 +31,16 @@ cudaStream_t create_external_stream() {
   // capture mode. The easiest solution is to handle stream creation
   // and deletion ourselves.
 
-  // Be sure to call cudaStreamDestroy on this when it is finished
-  // being used.
-  cudaStream_t child_stream;
   // we use cudaStreamNonBlocking because every default cuda stream in
   // pytorch uses that flag for all streams used for stream capture
   // (see kDefaultFlags in CUDAStream.cpp). This would need to be kept
   // in sync, should that ever change. Or kDefaultFlags needs to be
   // exposed in a header file.
+  auto stream_ptr = std::make_unique<cudaStream_t>();
   AT_CUDA_CHECK(
-      cudaStreamCreateWithFlags(&child_stream, cudaStreamNonBlocking));
-  return child_stream;
+      cudaStreamCreateWithFlags(stream_ptr.get(), cudaStreamNonBlocking));
+  return UniquePtrExternalCudaStream(
+      stream_ptr.release(), external_stream_deleter);
 }
 } // anonymous namespace
 
@@ -434,21 +440,26 @@ void CUDAGraph::begin_capture_to_if_node(
   AT_CUDA_CHECK(cudaStreamUpdateCaptureDependencies(
       getCurrentCUDAStream(), &cond_node, 1, cudaStreamSetCaptureDependencies));
 
-  cudaStream_t child_stream = create_external_stream();
+  UniquePtrExternalCudaStream child_stream = create_external_stream();
   conditional_graph_capture_streams_ids_.push(-1);
   c10::cuda::CUDACachingAllocator::endAllocateToPool(capture_dev_, mempool_id_);
   c10::cuda::CUDACachingAllocator::beginAllocateToPool(
       capture_dev_, mempool_id_, create_child_allocate_filter());
   AT_CUDA_CHECK(cudaStreamBeginCaptureToGraph(
-      child_stream, if_node_child_graph, nullptr, nullptr, 0, capture_mode_));
+      *child_stream, if_node_child_graph, nullptr, nullptr, 0, capture_mode_));
 
   AT_CUDA_CHECK(cudaStreamGetCaptureInfo(
-      child_stream, &status, &conditional_graph_capture_streams_ids_.top()));
+      *child_stream, &status, &conditional_graph_capture_streams_ids_.top()));
   TORCH_INTERNAL_ASSERT(
       status == cudaStreamCaptureStatus::cudaStreamCaptureStatusActive);
 
-  conditional_node_streams_.emplace(getStreamFromExternal(
-      child_stream, getCurrentCUDAStream().device_index()));
+  // We need to get the raw_stream here before emplace() to prevent
+  // std::move(child_stream) from potentially executing before
+  // *child_stream.
+  cudaStream_t raw_stream = *child_stream;
+  conditional_node_streams_.emplace(
+      getStreamFromExternal(raw_stream, getCurrentCUDAStream().device_index()),
+      std::move(child_stream));
 
   {
     std::unique_lock<std::mutex> lock(_currently_capturing_graphs_mutex);
@@ -510,13 +521,13 @@ cudaGraphConditionalHandle CUDAGraph::begin_capture_to_while_loop_node(
   AT_CUDA_CHECK(cudaStreamUpdateCaptureDependencies(
       getCurrentCUDAStream(), &cond_node, 1, cudaStreamSetCaptureDependencies));
 
-  cudaStream_t child_stream = create_external_stream();
+  UniquePtrExternalCudaStream child_stream = create_external_stream();
   conditional_graph_capture_streams_ids_.push(-1);
   c10::cuda::CUDACachingAllocator::endAllocateToPool(capture_dev_, mempool_id_);
   c10::cuda::CUDACachingAllocator::beginAllocateToPool(
       capture_dev_, mempool_id_, create_child_allocate_filter());
   AT_CUDA_CHECK(cudaStreamBeginCaptureToGraph(
-      child_stream,
+      *child_stream,
       while_node_child_graph,
       nullptr,
       nullptr,
@@ -524,12 +535,17 @@ cudaGraphConditionalHandle CUDAGraph::begin_capture_to_while_loop_node(
       capture_mode_));
 
   AT_CUDA_CHECK(cudaStreamGetCaptureInfo(
-      child_stream, &status, &conditional_graph_capture_streams_ids_.top()));
+      *child_stream, &status, &conditional_graph_capture_streams_ids_.top()));
   TORCH_INTERNAL_ASSERT(
       status == cudaStreamCaptureStatus::cudaStreamCaptureStatusActive);
 
-  conditional_node_streams_.emplace(getStreamFromExternal(
-      child_stream, getCurrentCUDAStream().device_index()));
+  // We need to get the raw_stream here before emplace() to prevent
+  // std::move(child_stream) from potentially executing before
+  // *child_stream.
+  cudaStream_t raw_stream = *child_stream;
+  conditional_node_streams_.emplace(
+      getStreamFromExternal(raw_stream, getCurrentCUDAStream().device_index()),
+      std::move(child_stream));
 
   {
     std::unique_lock<std::mutex> lock(_currently_capturing_graphs_mutex);
@@ -557,12 +573,11 @@ void CUDAGraph::end_capture_to_conditional_node() {
     _currently_capturing_graphs.erase(capture_id);
   }
 
-  CUDAStream stream = conditional_node_streams_.top().current_stream();
-  conditional_node_streams_.pop();
+  CUDAStream stream = conditional_node_streams_.top().first.current_stream();
   cudaGraph_t graph;
   AT_CUDA_CHECK(cudaStreamEndCapture(stream.stream(), &graph));
   descendent_graphs_.push_back(graph);
-  AT_CUDA_CHECK(cudaStreamDestroy(stream.stream()));
+  conditional_node_streams_.pop();
   conditional_graph_capture_streams_ids_.pop();
 
   c10::cuda::CUDACachingAllocator::endAllocateToPool(capture_dev_, mempool_id_);

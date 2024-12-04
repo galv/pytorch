@@ -24,6 +24,9 @@ struct CUDAGeneratorState;
 
 namespace cuda {
 
+using UniquePtrExternalCudaStream =
+    std::unique_ptr<cudaStream_t, void (*)(cudaStream_t*)>;
+
 // Standalone way to get a unique mempool id usable as a pool=... argument
 // to CUDAGraph::capture_begin
 TORCH_CUDA_CPP_API MempoolId_t graph_pool_handle();
@@ -132,7 +135,8 @@ struct TORCH_CUDA_CPP_API CUDAGraph {
   cudaStreamCaptureMode capture_mode_;
 
 #if !defined(USE_ROCM) && (defined(CUDA_VERSION) && CUDA_VERSION >= 12040)
-  std::stack<at::cuda::CUDAStreamGuard> conditional_node_streams_;
+  std::stack<std::pair<at::cuda::CUDAStreamGuard, UniquePtrExternalCudaStream>>
+      conditional_node_streams_;
   std::stack<CaptureId_t> conditional_graph_capture_streams_ids_;
   std::vector<cudaGraph_t> descendent_graphs_;
 #endif // !defined(USE_ROCM) && defined(CUDA_VERSION) && CUDA_VERSION >= 12040
