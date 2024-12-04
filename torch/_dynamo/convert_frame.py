@@ -232,7 +232,9 @@ def preserve_global_state(fn: Callable[_P, _T]) -> Callable[_P, _T]:
                     # unavoidable. Presumably even under stream
                     # capture, we still want to save and restore the
                     # rng state.
-                    cuda_rng_state = torch.cuda.default_generators[torch.cuda.current_device()].graphsafe_get_state()
+                    cuda_rng_state = torch.cuda.default_generators[
+                        torch.cuda.current_device()
+                    ].graphsafe_get_state()
             allow_tf32 = torch._C._get_cublas_allow_tf32()
             prior_fwd_from_src = torch.fx.graph_module._forward_from_src
             torch.fx.graph_module._forward_from_src = fx_forward_from_src_skip_result
@@ -261,7 +263,9 @@ def preserve_global_state(fn: Callable[_P, _T]) -> Callable[_P, _T]:
                     if not torch.cuda.is_current_stream_capturing():
                         torch.cuda.set_rng_state(cuda_rng_state)
                     else:
-                        torch.cuda.default_generators[torch.cuda.current_device()].graphsafe_set_state(cuda_rng_state)
+                        torch.cuda.default_generators[
+                            torch.cuda.current_device()
+                        ].graphsafe_set_state(cuda_rng_state)
                 torch._C._set_cublas_allow_tf32(allow_tf32)
                 torch.fx.graph_module._forward_from_src = prior_fwd_from_src
                 assert (
