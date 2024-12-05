@@ -207,17 +207,20 @@ def while_loop_dense(cond_fn, body_fn, carried_inputs, additional_inputs):
 def cond_op_cudagraph(mode, cond_fn, body_fn, carried_inputs, additional_inputs):
     if not mode.inside_already_warmed_up_op:
         for fn in (cond_fn, body_fn):
-            if fn not in mode.warmed_up_control_flow_ops:
-                warmup_mode = ControlFlowOpWarmupDispatchMode()
-                with warmup_mode:
-                    fn(*carried_inputs, *additional_inputs)
-                mode.warmed_up_control_flow_ops.add(fn)
+            warmup_mode = ControlFlowOpWarmupDispatchMode()
+            with warmup_mode:
+                fn(*carried_inputs, *additional_inputs)
     mode.inside_already_warmed_up_op = True
-    # Re-enter this mode in order to handle nested control flow
-    # operations
+    # Re-enter this mode in order to make sure we capture both sides
+    # of nested control flow operations that may be nested in cond_fn
+    # and body_fn
     with mode:
-        output = while_loop_node(cond_fn, body_fn, carried_inputs, additional_inputs)
-    mode.inside_already_warmed_up_op = False
+        try:
+            output = while_loop_node(
+                cond_fn, body_fn, carried_inputs, additional_inputs
+            )
+        finally:
+            mode.inside_already_warmed_up_op = False
     return output
 
 

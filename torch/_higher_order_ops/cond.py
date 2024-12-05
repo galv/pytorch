@@ -387,17 +387,18 @@ def cond_op_cudagraph(mode, pred, true_fn, false_fn, operands):
     assert torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
     if not mode.inside_already_warmed_up_op:
         for fn in (true_fn, false_fn):
-            if fn not in mode.warmed_up_control_flow_ops:
-                warmup_mode = ControlFlowOpWarmupDispatchMode()
-                with warmup_mode:
-                    fn(*operands)
-                mode.warmed_up_control_flow_ops.add(fn)
+            warmup_mode = ControlFlowOpWarmupDispatchMode()
+            with warmup_mode:
+                fn(*operands)
     mode.inside_already_warmed_up_op = True
-    # Re-enter this mode in order to handle nested control flow
-    # operations
+    # Re-enter this mode in order to make sure we capture both sides
+    # of control flow operations that may be nested in true_fn and
+    # false_fn
     with mode:
-        output = if_else_node(pred, true_fn, false_fn, operands)
-    mode.inside_already_warmed_up_op = False
+        try:
+            output = if_else_node(pred, true_fn, false_fn, operands)
+        finally:
+            mode.inside_already_warmed_up_op = False
     return output
 
 

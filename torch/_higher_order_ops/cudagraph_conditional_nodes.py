@@ -10,7 +10,6 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 class CUDAGraphCaptureControlFlowOpDispatchMode(TorchDispatchMode):
     def __init__(self):
-        self.warmed_up_control_flow_ops = set()
         self.inside_already_warmed_up_op = False
 
     def __torch_dispatch__(
