@@ -536,9 +536,10 @@ def make_graphed_callables(
 
 @contextlib.contextmanager
 def thread_cuda_stream_capture_mode(new_mode):
-    r"""Context manager that changes the current thread's stream capture mode to `new_mode` upon __enter__ and resets the thread's stream capture mode to its original value upon __exit__.
+    r"""Changes current thread's stream capture mode to `new_mode` upon __enter__ and resets the mode upon __exit__.
 
-    The only documentation on a thread's stream capture mode is here: https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html#group__CUDART__STREAM_1g9d0535d93a214cbf126835257b16ba85
+    The only documentation on a thread's stream capture mode is here:
+    https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html#group__CUDART__STREAM_1g9d0535d93a214cbf126835257b16ba85
 
     However, it is a little bit inadequate, so here is a more in-depth description.
 
