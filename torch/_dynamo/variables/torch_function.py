@@ -10,7 +10,6 @@ from typing import Deque, Dict, List, TYPE_CHECKING
 import torch._C
 import torch.utils._pytree as pytree
 from torch._guards import Source
-from torch.cuda.graphs import create_external_stream, thread_cuda_stream_capture_mode
 from torch.overrides import (
     _get_overloaded_args,
     BaseTorchFunctionMode,
@@ -139,35 +138,15 @@ def populate_builtin_to_tensor_fn_map():
         """
 
         def __torch_function__(self, func, types, args=(), kwargs=None):
-            ctx_manager = contextlib.ExitStack()
-            # We use relaxed stream capture in order to prevent
-            # breaking any currently existing stream capture.
+            kwargs = kwargs or {}
+            nonlocal most_recent_func
+            most_recent_func = func
+            return func(*args, **kwargs)
 
-            # We use an external side stream to avoid capturing these
-            # function calls in case the current stream is capturing,
-            # or in case the stream returned by torch.cuda.Stream() is
-            # aliased to an existing stream that is already capturing.
-
-            # That side stream is itself not capturing because
-            # operator.not_ will do cudaStreamSynchronize()
-            if torch.cuda.is_available():
-                cudart = torch.cuda.cudart()
-                ctx_manager.enter_context(
-                    thread_cuda_stream_capture_mode(
-                        cudart.cudaStreamCaptureMode.Relaxed
-                    )
-                )
-                ctx_manager.enter_context(torch.cuda.stream(create_external_stream()))
-            with ctx_manager:
-                kwargs = kwargs or {}
-                nonlocal most_recent_func
-                most_recent_func = func
-                return func(*args, **kwargs)
-
-    inp0 = torch.ones(1)
-    inp1 = torch.ones(1)
-    inp0_int = torch.ones(1, dtype=torch.int32)
-    inp1_int = torch.ones(1, dtype=torch.int32)
+    inp0 = torch.ones(1, device="cpu")
+    inp1 = torch.ones(1, device="cpu")
+    inp0_int = torch.ones(1, dtype=torch.int32, device="cpu")
+    inp1_int = torch.ones(1, dtype=torch.int32, device="cpu")
     with GetMethodMode():
         setups_and_oplists = [
             (lambda o: o(inp0), un_ops),
