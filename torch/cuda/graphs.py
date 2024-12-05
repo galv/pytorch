@@ -185,14 +185,10 @@ class graph:
         collect_garbage: bool = True,
     ):
         # Lazy-init of default_capture_stream helps avoid circular-import errors.
+        # Not thread safe, but graphs already have the general (explicitly documented)
+        # restriction that only one capture may be underway at a time in the process.
         if self.__class__.default_capture_stream is None:
-            # Ideally we would create a new external stream for every
-            # __enter__, which is then destroyed on __exit__, but that
-            # technically will break the interface in case any user is
-            # accessing graph.default_capture_stream.
-            self.__class__.default_capture_stream = create_external_stream()
-
-            # from torch._dynamo._variables import torch_function
+            self.__class__.default_capture_stream = torch.cuda.Stream()
 
         self.pool = () if pool is None else (pool,)
         self.capture_stream = (
