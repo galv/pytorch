@@ -7,7 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 from torch._dynamo.utils import counters
-from torch._inductor.utils import InputType
+from torch._inductor.utils import InputType, tensor_is_aligned
 
 
 perf_hint_log = torch._logging.getArtifactLogger(__name__, "perf_hints")
@@ -119,6 +119,15 @@ def get_mutation_stack_trace(
 
     return msg
 
+def is_copy_elided_input_or_output(input: InputType):
+    if isinstance(input, int):
+        assert False, "how can you ever mutate a constant integer?"
+        return True
+    elif (isinstance(input, torch.Tensor) and 
+          torch._inductor.config.triton.cudagraphs_elide_input_output_copies):
+        # Technically, we don't care about alignment for plain eager
+        # mode pytorch (through the cudagraphs backend)
+        return tensor_is_aligned(input)
 
 def check_for_mutation(
     func: WrappedFunction,
@@ -132,8 +141,9 @@ def check_for_mutation(
             idx
             for idx in func.mutated_input_idxs
             if not (
-                idx in func.static_input_idxs
+                idx in func.static_input_idxs # e.g., parameter update
                 or is_cuda_graph_recorded_tensor(inputs[idx])  # type: ignore[arg-type]
+                or is_copy_elided_input_or_output(inputs[idx])
             )
         ]
     else:

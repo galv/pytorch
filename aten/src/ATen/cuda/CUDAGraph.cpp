@@ -352,6 +352,16 @@ std::optional<std::tuple<size_t, size_t>> checkAllocationWithinGraph(void* ptr, 
 }
 
 void CUDAGraph::become_dynamic(const std::vector<at::Tensor>& dynamic_tensors) {
+  // TODO: we could deallocate the backing memory for some dynamic
+  // inputs (e.g., the inputs and outputs to a graph), but not for
+  // others (e.g., parameters that we might want to swap). It might be
+  // useful to enable an option to do this in order to avoid leaving
+  // extra space. Then again, if we simply use virtual memory for the
+  // allocation, and alias all virtual apges to a single 2 MiB
+  // physical page, we don't benefit much from deallocating. However,
+  // that probably rquires torch.cuda.MemPool to be integrated. Note
+  // that we want to specify that the addresses cannot be read or
+  // write to make sure they are never accidentally used.
   TORCH_CHECK(dynamic_graph_, "Graph must have been captured with dynamic_graph=True");
   TORCH_CHECK(allocations_.empty(), "Must not have already called become_dynamic");
   TORCH_CHECK(!dynamic_tensors.empty(), "Must have at least one dynamic tensor");

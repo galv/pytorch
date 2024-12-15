@@ -19,10 +19,12 @@ with a lot of caveats.  CUDA graph trees remove these restrictions:
 * Previously, if you executed graph A, some non-CUDA graph code, and then
   graph B, after executing graph B, it was not safe to retain any references
   to intermediates produced by A.  With CUDA graph trees, we track if any
-outputs of graph A are still live by the time graph B is run, and make
+outputs (does dynamo report the "outputs"? What makes somethinga n output?) of graph A are still live by the time graph B is run, and make
   sure graph B doesn't clobber there memory when reusing the CUDA graphs
   pool.  You'll get a separate recording of B depending on what tensors
   stay live or dead.
+
+Can we remove the need for this functionality?
 
 CUDA graph trees are flexible enough to be used in Dynamo across graph breaks,
 which is their primary use case.
@@ -225,7 +227,7 @@ class TreeManagerContainer:
 
         # Following two objects are only set in the case that Tensor outputs outlive
         # the cudagraphify_fns. Reference to the Graph is needed to keep the private pool from
-        # deallocation.
+        # deallocation. Gross!!!
         self.live_storages_count = 0
         self.graph: Optional[torch.cuda.CUDAGraph] = None
 
@@ -243,6 +245,9 @@ class TreeManagerContainer:
                     self.tree_manager = None
 
     def finalize_cudagraphify_fn(self) -> None:
+        # So the python finalizer will decrement this on its
+        # own. Wow. How do we know when the finalizer will run,
+        # though?
         with self.lock:
             self.live_cudagraphify_fns -= 1
             if self.live_cudagraphify_fns == 0:
@@ -251,6 +256,9 @@ class TreeManagerContainer:
     def _finalize_tree_manager(self) -> None:
         assert self.lock.locked()
         self.tree_manager = None
+
+        # Note from GALVEZ: We won't need this if we can elide output
+        # copies.
 
         # TODO - when issue #91395 is landed, we can set a weakref on
         # storages and trigger a deallocation when all outputs of the
@@ -364,6 +372,8 @@ def cudagraphify_impl(
     **kwargs: Any,
 ) -> ModelType:
     fn_cache: Dict[Tuple[int, ...], Callable[..., Any]] = {}
+    # I think my outputs are a pytree of tensors, right?
+    static_out_cache: Dict[Tuple[int, ...], Tuple[torch.Tensor, ...]] = {}
 
     # Detect int inputs: we need to index on these
     int_key = [i for i, v in enumerate(inputs) if isinstance(v, int)]
@@ -379,6 +389,8 @@ def cudagraphify_impl(
         int_key = get_ints(inputs)
         fn = fn_cache.get(int_key)
         if fn is not None:
+            # Need to somehow pass the outputs as well, and remap the
+            # appropriate addresses in the graph called here...
             return fn(inputs)
 
         if int_key is None:
@@ -393,11 +405,18 @@ def cudagraphify_impl(
         # and finally copy
         check_input_idxs = get_input_idxs_to_check(inputs, static_input_idxs)
         new_static_input_idxs = remove_unaligned_input_idxs(inputs, static_input_idxs)
+        # Okay, so if the inputs themselves are misaligned, they get copied.
+        # Add new config? Require all inputs aligned?
         copy_misaligned_inputs(inputs, check_input_idxs)
 
+        # out here corresponds to static outputs. So I need to add code here...
         fn, out = cudagraphify(model, inputs, new_static_input_idxs, *args, **kwargs)
         fn = align_inputs_from_check_idxs(fn, inputs_to_check=check_input_idxs)
         fn_cache[int_key] = fn
+        print("GALVEZ: type(out)=", type(out))
+        # No, a static_out_cache isn't right. Let CUDAGraphNode::run
+        # be responsible for allocaitng new tensors itself.
+        static_out_cache[int_key] = out
 
         return out
 
@@ -411,7 +430,7 @@ def cudagraphify(
     *,
     device_index: int,
     is_backward: bool,
-    is_inference: bool,
+    is_inference: bool, # How do we set is_inference? torch.nograd?
     stack_traces: Optional[StackTraces] = None,
     constants: Tuple[torch.Tensor, ...] = (),
     placeholders: Tuple[PlaceholderInfo, ...] = (),
@@ -603,7 +622,7 @@ class CUDAWarmupNode:
         self.cuda_graphs_pool = cuda_graphs_pool
         self.outputs_weakrefs: List[Optional[StorageWeakRefWrapper]] = []
         self.tensor_weakrefs: List[Optional[TensorWeakRef]] = []
-        self.existing_cuda_graph = existing_cuda_graph
+        self.existing_cuda_graph = existing_cuda_graph # does nothing lol
         self.has_run = False
         self.device_index = device_index
         self.stack_traces = stack_traces
@@ -985,6 +1004,7 @@ class CUDAGraphNode:
                 assert isinstance(out, (int, type(None))), type(out)
                 self.outputs_metadata.append(out)
 
+        # Why replay in init?
         self.graph.replay()
 
     def _copy_inputs_and_remove_from_src(
@@ -1038,12 +1058,18 @@ class CUDAGraphNode:
     def run(self, new_inputs: List[InputType]) -> OutputType:
         self.check_static_inputs_are_stable(new_inputs)
 
-        self._copy_inputs_and_remove_from_src(self.reconstructed_inputs, new_inputs)
-        new_inputs.clear()
+        # TODO: do replay_dynamic() here (also consider outputs!)
 
-        self.run_graph()
+        if not config.triton.cudagraphs_elide_input_output_copies:
+            self._copy_inputs_and_remove_from_src(self.reconstructed_inputs, new_inputs)
+            new_inputs.clear()
 
-        outputs = self.reconstruct_outputs()
+            self.run_graph()
+
+            outputs = self.reconstruct_outputs()
+        else:
+            
+            self.graph.replay_dynamic()
 
         if config.triton.fast_path_cudagraph_asserts:
             self.debug_check_invariants_after_invocation()
@@ -1075,6 +1101,7 @@ class CUDAGraphNode:
                 outputs.append(metadata)
                 continue
 
+            # Why wouldn't it be none?
             cached_t = self.cached_tensor_outputs[i]
             if cached_t is not None:
                 # this output represents a fresh allocated tensor.
@@ -1099,6 +1126,7 @@ class CUDAGraphNode:
                 storage_info, metadata
             )
 
+            # When does the copy happen?
             if isinstance(storage, UntypedStorage) or storage is None:
                 out = self._reconstruct_from_tensor_metadata(metadata, storage)
             else:
@@ -1203,6 +1231,7 @@ class CUDAGraphNode:
         ), get_history_recording():
             static_outputs = model(inputs)
 
+        # Talk about confusing here...
         # running model should reclaim memory
         assert len(inputs) == 0
 
@@ -1567,6 +1596,7 @@ class CUDAGraphNode:
         self, metadata: Dict[str, Any], storage: Optional[UntypedStorage] = None
     ) -> Tensor:
         s = self.create_storage(metadata) if storage is None else storage
+        # Why do we need C++ for this?
         return torch._C._construct_CUDA_Tensor_From_Storage_And_Metadata(metadata, s)  # type: ignore[arg-type]
 
     def create_storage(self, metadata: Dict[str, Any]) -> torch.types.Storage:
@@ -1819,6 +1849,7 @@ class CUDAGraphTreeManager:
         # when they are first invoked, none of their inputs are outputs are outputs
         # of another node, nor are there any live outputs of another node whose
         # liveness would create a dependency.
+        # len(self.roots) == self.graph_counter? Maybe?
         self.roots: Dict[FunctionID, List[CUDAGraphNode]] = defaultdict(list)
 
         # mapping from function id to wrapped function
@@ -1834,6 +1865,10 @@ class CUDAGraphTreeManager:
 
         # warn only once if a function mutates inputs
         self.warned_mutation: Set[FunctionID] = set()
+
+        # Yikes, that sounds incredibly dangerous. What if you use
+        # fork-join parallelism in your cuda graph? Does that work? I
+        # don't think so...
 
         # NB: cuda caching allocator will remember the stream a segment is allocated to
         # and only allocate that segment to the same stream. we need to use a single stream
@@ -1878,6 +1913,8 @@ class CUDAGraphTreeManager:
         # there is no current node the state will be ExecutionState.None.
         self.path_state = ExecutionState.NONE
         self.device_index = device_index
+
+        # I think a node simply refers to a cuda graph wrapping a function
 
         # the most recently invoked cudagraph wrapping of a function. Will be None
         # when there is no output from a previous recording or execution whose memory
@@ -1949,6 +1986,7 @@ class CUDAGraphTreeManager:
             inputs,
             self._get_cuda_graph_recorded_tensor_checker(),
         ):
+            print("GALVEZ:WARNING:detecting input mutations that prevent using cuda graphs!")
             self.non_cudagraph_managed_mutation_hint[node_id][function_id] = True
             # warn once per function_id
             if function_id in self.warned_mutation:
@@ -1988,7 +2026,10 @@ class CUDAGraphTreeManager:
         if self.in_warmup:
             self.try_end_curr_warmup(function_id)
 
+        # node_id vs function_id? It seems that a function_id can have
+        # multiple node_ids...
         node_id = self._get_node_id()
+        # So a node can map to multiple functions? What is a function vs. a node?
         if function_id not in self.non_cudagraph_managed_mutation_hint[node_id]:
             self._update_non_cudagraph_managed_mutation(function_id, new_inputs)
 
@@ -2000,7 +2041,7 @@ class CUDAGraphTreeManager:
         ] or self.exceed_rerecord_limit(node_id, function_id):
             return self.ids_to_funcs[function_id].model(new_inputs)
 
-        # warming up a function and subsequentally recording may use different memory addresses
+        # warming up a function and subsequentially recording may use different memory addresses
         # because both depend on the state of the caching allocator. if we warm up graph A,
         # then warm up graph B and make more allocations, the subsequent recording of A will not
         # necessarily use the same addresses as in the warm up. Thus any warm up of a node can only
@@ -2009,7 +2050,7 @@ class CUDAGraphTreeManager:
             (
                 not (
                     function_id in self.warmed_up_functions
-                    or config.triton.skip_cudagraph_warmup
+                    or config.triton.skip_cudagraph_warmup  # why wouldn't this be false?
                 )
             )
             or self.in_warmup
@@ -2019,7 +2060,7 @@ class CUDAGraphTreeManager:
             # Both Recording and Warmup will be reflected in the allocator and dont need changes
             if self.path_state == ExecutionState.EXECUTION:
                 self.apply_checkpoint_execution_state_in_allocator()
-
+            # Can relaxed stream capture allow us to avoid running in eager at all?
             return self.run_eager(new_inputs, function_id)
 
         assert not isinstance(self.current_node, CUDAWarmupNode)
@@ -2146,6 +2187,7 @@ class CUDAGraphTreeManager:
         self.current_node = node
         self.path_state = ExecutionState.EXECUTION
         self.update_generation()
+        # This runs what I want
         return node.run(new_inputs)
 
     def run_eager(
@@ -2209,6 +2251,7 @@ class CUDAGraphTreeManager:
         fn = functools.partial(self.run, function_id=id)
 
         # container needs to set clean up when fn dies
+        # Tada!
         get_container(self.device_index).add_strong_reference(fn)
         return fn, fn(inputs)
 

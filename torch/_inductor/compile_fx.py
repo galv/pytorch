@@ -581,7 +581,8 @@ def _compile_fx_inner(
                     if isinstance(t, torch.Tensor)
                 )
 
-                if not config.triton.cudagraph_support_input_mutation:
+                if (not config.triton.cudagraph_support_input_mutation and
+                    not config.triton.cudagraphs_elide_input_output_copies):
                     # Skip supports for cudagraph-managed tensors
                     from torch._inductor.cudagraph_utils import (
                         check_for_mutation_ignore_cuda_graph_managed_tensor,

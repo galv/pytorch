@@ -1924,6 +1924,7 @@ def should_assume_input_aligned(example_input: torch.Tensor):
     # right now, we only care about alignment for cuda tensors.
     if not is_gpu(example_input.device.type):
         return False
+    # We can use config.assume_aligned_inputs!
     return config.assume_aligned_inputs or tensor_is_aligned(example_input)
 
 
@@ -1996,6 +1997,7 @@ def align_inputs_from_check_idxs(
         return model
 
     def run(new_inputs: List[InputType]):
+        # copy_misaligned_inputs is scary!
         copy_misaligned_inputs(new_inputs, inputs_to_check)
         return model(new_inputs)
 
