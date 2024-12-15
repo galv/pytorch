@@ -205,30 +205,25 @@ def while_loop_dense(cond_fn, body_fn, carried_inputs, additional_inputs):
 # WAR for https://github.com/pytorch/pytorch/issues/140322
 @while_loop_op.py_impl(CUDAGraphCaptureControlFlowOpDispatchMode)
 def cond_op_cudagraph(mode, cond_fn, body_fn, carried_inputs, additional_inputs):
-    if not mode.inside_already_warmed_up_op:
-        for fn in (cond_fn, body_fn):
-            warmup_mode = ControlFlowOpWarmupDispatchMode()
-            with warmup_mode:
-                fn(*carried_inputs, *additional_inputs)
-    mode.inside_already_warmed_up_op = True
-    # Re-enter this mode in order to make sure we capture both sides
-    # of nested control flow operations that may be nested in cond_fn
-    # and body_fn
+    assert torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+    # Re-enter this mode because addition torch.cond() and
+    # torch.while_loop() calls may be nested inside cond_fn or body_fn
     with mode:
-        try:
-            output = while_loop_node(
-                cond_fn, body_fn, carried_inputs, additional_inputs
-            )
-        finally:
-            mode.inside_already_warmed_up_op = False
-    return output
+        return while_loop_node(
+            cond_fn, body_fn, carried_inputs, additional_inputs
+        )
 
 
 # WAR for https://github.com/pytorch/pytorch/issues/140322
 @while_loop_op.py_impl(ControlFlowOpWarmupDispatchMode)
 def while_loop_warmup(mode, cond_fn, body_fn, carried_inputs, additional_inputs):
-    assert torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-    return while_loop_node(cond_fn, body_fn, carried_inputs, additional_inputs)
+    with torch.cuda.graph(torch.cuda.CUDAGraph(),
+                          stream=mode.capture_stream,
+                          capture_error_mode="relaxed"):
+        while_loop_node(cond_fn, body_fn, carried_inputs, additional_inputs)
+    # Since ControlFlowOpWarmupDispatchMode has been popped, this call
+    # will fall back to while_loop_dense
+    return while_loop_dense(cond_fn, body_fn, carried_inputs, additional_inputs)
 
 
 while_loop_op.py_impl(DispatchKey.Autograd)(

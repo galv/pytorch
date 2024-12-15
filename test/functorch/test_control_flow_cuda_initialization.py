@@ -2,6 +2,7 @@
 import unittest
 
 import torch
+from torch._higher_order_ops.cudagraph_conditional_nodes import ControlFlowOpWarmupDispatchMode
 from torch.testing._internal.common_utils import (
     run_tests,
     TEST_CUDA_GRAPH_CONDITIONAL_NODES,
@@ -46,8 +47,19 @@ class TestControlFlowInCUDAGraphInitialization(TestCase):
         x = torch.randn(33, 16, 30, device="cuda")
         filters = torch.randn(20, 16, 5, device="cuda")
 
-        with torch.cuda.graph(g, capture_error_mode="thread_local"):
+        with ControlFlowOpWarmupDispatchMode():
             f(pred, x, filters)
+
+        with torch.cuda.graph(g, capture_error_mode="thread_local"):
+            static_output = f(pred, x, filters)
+
+        pred.logical_not_()
+
+        g.replay()
+
+        eager_output = f(pred, x, filters)
+
+        self.assertEqual(static_output, eager_output)
 
         self.assertTrue(torch._C._cuda_hasPrimaryContext(0))
 
@@ -68,11 +80,21 @@ class TestControlFlowInCUDAGraphInitialization(TestCase):
         pred = torch.tensor(True, device="cuda")
         x = torch.ones(1024 * 1024, device="cuda")
 
-        with torch.cuda.graph(g, capture_error_mode="thread_local"):
+        with ControlFlowOpWarmupDispatchMode():
             f(pred, x)
 
-        self.assertTrue(torch._C._cuda_hasPrimaryContext(0))
+        with torch.cuda.graph(g, capture_error_mode="thread_local"):
+            static_output = f(pred, x)
 
+        pred.logical_not_()
+
+        g.replay()
+
+        eager_output = f(pred, x)
+
+        self.assertEqual(static_output, eager_output)
+
+        self.assertTrue(torch._C._cuda_hasPrimaryContext(0))
 
 if __name__ == "__main__":
     run_tests()

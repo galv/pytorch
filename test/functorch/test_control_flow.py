@@ -12,6 +12,7 @@ from torch._higher_order_ops.associative_scan import (
     _fake_associative_scan,
     associative_scan,
 )
+from torch._higher_order_ops.cudagraph_conditional_nodes import ControlFlowOpWarmupDispatchMode
 from torch._higher_order_ops.scan import _fake_scan, scan
 from torch._higher_order_ops.while_loop import while_loop
 from torch._subclasses.functional_tensor import (
@@ -45,14 +46,19 @@ from torch.testing._internal.common_utils import (
 
 
 def _check_compile_cudagraph(test_case, fn, args):
-    eager_res = fn(*args)
+    # Do warmup
+    with ControlFlowOpWarmupDispatchMode():
+        fn(*args)
 
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        eager_sc_res = fn(*args)
+        eager_static_res = fn(*args)
 
     g.replay()
-    test_case.assertEqual(eager_res, eager_sc_res)
+
+    eager_res = fn(*args)
+
+    test_case.assertEqual(eager_res, eager_static_res)
 
     # test cudagraphs backend
     compiled_fn = torch.compile(fn, backend="cudagraphs")

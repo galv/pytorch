@@ -9,9 +9,6 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 
 class CUDAGraphCaptureControlFlowOpDispatchMode(TorchDispatchMode):
-    def __init__(self):
-        self.inside_already_warmed_up_op = False
-
     def __torch_dispatch__(
         self,
         func,
@@ -23,53 +20,75 @@ class CUDAGraphCaptureControlFlowOpDispatchMode(TorchDispatchMode):
         return func(*args, **kwargs)
 
 
+# class ControlFlowOpWarmupDispatchMode(TorchDispatchMode):
+#     def __init__(
+#         self,
+#     ) -> None:
+#         self.stream = torch.cuda.graphs.create_external_stream()
+#         self.throw_away_graph: Optional[torch.cuda.CUDAGraph] = None
+#         self.graph_ctx: Optional[torch.cuda.graph] = None
+
+#     # Why don't I just use a throwaway graph for every cond and
+#     # while_loop op? Seems a lot simpler...
+#     def __enter__(self) -> Self:
+#         self.throw_away_graph = torch.cuda.CUDAGraph()
+#         # relaxed stream capture can still fail if a synchronizing API
+#         # is called. But then this workload could not be captured in a
+#         # cuda graph anyway, so such a failure is fine.
+#         self.graph_ctx = torch.cuda.graph(
+#             self.throw_away_graph,
+#             stream=self.stream,
+#             capture_error_mode="relaxed",
+#             collect_garbage=False,
+#         )
+#         self.graph_ctx.__enter__()
+#         super().__enter__()
+#         return self
+
+#     def __exit__(
+#         self,
+#         exc_type,
+#         exc_val,
+#         exc_tb,
+#     ) -> None:
+#         super().__exit__(exc_type, exc_val, exc_tb)
+#         assert self.graph_ctx is not None
+#         with torch.cuda.graphs.thread_cuda_stream_capture_mode(
+#             torch.cuda.cudart().cudaStreamCaptureMode.Relaxed
+#         ):
+#             self.graph_ctx.__exit__(exc_type, exc_val, exc_tb)
+#             # The destructor of self.throw_away_graph calls
+#             # cudaGraphExecDestroy(), which is an unsafe call for any
+#             # other streams that are currently capturing to a graph. To
+#             # prevent invalidating other capturing streams, this thread
+#             # must remain in relaxed stream capture mode when the
+#             # destructor runs. Therefore, we manually delete
+#             # self.throw_away_graph (and self.graph_ctx, which has a
+#             # strong reference to it) now rather than letting them be
+#             # automatically destroyed when this
+#             # ControlFlowOpWarmupDispatchMode instance is deleted.
+#             del self.graph_ctx
+#             del self.throw_away_graph
+
+#     def __torch_dispatch__(
+#         self,
+#         func,
+#         types,
+#         args=(),
+#         kwargs=None,
+#     ):
+#         kwargs = {} if kwargs is None else kwargs
+#         with torch.cuda.graphs.thread_cuda_stream_capture_mode(
+#             torch.cuda.cudart().cudaStreamCaptureMode.Relaxed
+#         ):
+#             return func(*args, **kwargs)
+
+
 class ControlFlowOpWarmupDispatchMode(TorchDispatchMode):
     def __init__(
         self,
     ) -> None:
-        self.stream = torch.cuda.graphs.create_external_stream()
-        self.throw_away_graph: Optional[torch.cuda.CUDAGraph] = None
-        self.graph_ctx: Optional[torch.cuda.graph] = None
-
-    def __enter__(self) -> Self:
-        self.throw_away_graph = torch.cuda.CUDAGraph()
-        # relaxed stream capture can still fail if a synchronizing API
-        # is called. But then this workload could not be captured in a
-        # cuda graph anyway, so such a failure is fine.
-        self.graph_ctx = torch.cuda.graph(
-            self.throw_away_graph,
-            stream=self.stream,
-            capture_error_mode="relaxed",
-            collect_garbage=False,
-        )
-        self.graph_ctx.__enter__()
-        super().__enter__()
-        return self
-
-    def __exit__(
-        self,
-        exc_type,
-        exc_val,
-        exc_tb,
-    ) -> None:
-        super().__exit__(exc_type, exc_val, exc_tb)
-        assert self.graph_ctx is not None
-        with torch.cuda.graphs.thread_cuda_stream_capture_mode(
-            torch.cuda.cudart().cudaStreamCaptureMode.Relaxed
-        ):
-            self.graph_ctx.__exit__(exc_type, exc_val, exc_tb)
-            # The destructor of self.throw_away_graph calls
-            # cudaGraphExecDestroy(), which is an unsafe call for any
-            # other streams that are currently capturing to a graph. To
-            # prevent invalidating other capturing streams, this thread
-            # must remain in relaxed stream capture mode when the
-            # destructor runs. Therefore, we manually delete
-            # self.throw_away_graph (and self.graph_ctx, which has a
-            # strong reference to it) now rather than letting them be
-            # automatically destroyed when this
-            # ControlFlowOpWarmupDispatchMode instance is deleted.
-            del self.graph_ctx
-            del self.throw_away_graph
+        self.capture_stream = torch.cuda.graphs.create_external_stream()
 
     def __torch_dispatch__(
         self,
@@ -78,11 +97,14 @@ class ControlFlowOpWarmupDispatchMode(TorchDispatchMode):
         args=(),
         kwargs=None,
     ):
+        # Why don't I just use a throwaway graph for every cond and
+        # while_loop op? Seems a lot simpler...
         kwargs = {} if kwargs is None else kwargs
         with torch.cuda.graphs.thread_cuda_stream_capture_mode(
             torch.cuda.cudart().cudaStreamCaptureMode.Relaxed
         ):
             return func(*args, **kwargs)
+
 
 
 def _is_boolean_scalar_cuda_tensor(pred: Any) -> bool:

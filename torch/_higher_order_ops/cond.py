@@ -385,29 +385,24 @@ def cond_op_dense(pred, true_fn, false_fn, operands):
 @cond_op.py_impl(CUDAGraphCaptureControlFlowOpDispatchMode)
 def cond_op_cudagraph(mode, pred, true_fn, false_fn, operands):
     assert torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-    if not mode.inside_already_warmed_up_op:
-        for fn in (true_fn, false_fn):
-            warmup_mode = ControlFlowOpWarmupDispatchMode()
-            with warmup_mode:
-                fn(*operands)
-    mode.inside_already_warmed_up_op = True
-    # Re-enter this mode in order to make sure we capture both sides
-    # of control flow operations that may be nested in true_fn and
+    # Re-enter this mode because addition torch.cond() and
+    # torch.while_loop() calls may be nested inside true_fn or
     # false_fn
     with mode:
-        try:
-            output = if_else_node(pred, true_fn, false_fn, operands)
-        finally:
-            mode.inside_already_warmed_up_op = False
-    return output
+        return if_else_node(pred, true_fn, false_fn, operands)
 
 
 # WAR for https://github.com/pytorch/pytorch/issues/140322
 @cond_op.py_impl(ControlFlowOpWarmupDispatchMode)
 def cond_op_warmup(mode, pred, true_fn, false_fn, operands):
-    assert torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-    return if_else_node(pred, true_fn, false_fn, operands)
-
+    with torch.cuda.graph(torch.cuda.CUDAGraph(),
+                          stream=mode.capture_stream,
+                          capture_error_mode="relaxed"):
+        if_else_node(pred, true_fn, false_fn, operands)
+    # Since ControlFlowOpWarmupDispatchMode has been popped, this call
+    # will fall back to cond_op_dense
+    return cond_op_dense(pred, true_fn, false_fn, operands)
+# return torch.cond(pred, true_fn, false_fn, operands)
 
 class CondAutogradOp(torch.autograd.Function):
     @staticmethod
