@@ -4,6 +4,9 @@
 #include <ATen/Functions.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAFunctions.h>
+#include <c10/cuda/driver_api.h>
+// Not good, aten shouldn't depend upon torch...
+#include <torch/csrc/cuda/CUDAPluggableAllocator.h>
 
 #include <chrono>
 #include <cstddef>
@@ -159,9 +162,22 @@ void CUDAGraph::capture_begin(MempoolId_t pool/*={0,0}*/, cudaStreamCaptureMode 
     TORCH_INTERNAL_ASSERT(mempool_id_.first > 0);
   }
 
+  MemPool* mempool = MemPoolContext::getActiveMemPool();
+  if (mempool->id() == mempool_id_) {
+    TORCH_CHECK_EQ(mempool->device(), capture_dev_);
+    // c10::cuda::CUDACachingAllocator::beginAllocateToPool(capture_dev_, mempool_id_, create_allocate_filter());
+    // we need to add this back in capture_end
+    // c10::cuda::CUDACachingAllocator::releasePool(mempool_id_);
+    c10::cuda::CUDACachingAllocator::endAllocateToPool(capture_dev_, mempool_id_);
+    // I feel like I should do this, but I'm not sure:
+  }
+  // mempool_context_ = mempool_id_
+
+  // I'm super confused...
   // Addendum: beginAllocateStreamToPool is now called before cudaStreamBeginCapture to prevent an
   // autograd thread's free() call triggering an invalid cudaEventRecord in the caching allocator
   // due to the capture status being updated _after_ a capture had already started.
+  // we need to run this again, in order to replace the filter...
   c10::cuda::CUDACachingAllocator::beginAllocateToPool(capture_dev_, mempool_id_, create_allocate_filter());
 
   // At this point, any NCCL watchdogs should be aware that we are in capture mode
@@ -205,6 +221,11 @@ void CUDAGraph::capture_end() {
   }
 
   c10::cuda::CUDACachingAllocator::endAllocateToPool(capture_dev_, mempool_id_);
+
+  MemPool* mempool = MemPoolContext::getActiveMemPool();
+  if (mempool->id() == mempool_id_) {
+    c10::cuda::CUDACachingAllocator::beginAllocateToPool(capture_dev_, mempool_id_, [](cudaStream_t) { return true; });
+  }
 
   TORCH_CHECK(graph_ != nullptr, "Invalid capture.");
   has_graph_ = true;
@@ -350,6 +371,15 @@ void CUDAGraph::reset() {
   if (has_graph_ || has_graph_exec_) {
     // notifyCaptureDestroy may throw. How should we handle this?
     c10::cuda::CUDACachingAllocator::releasePool(capture_dev_, mempool_id_);
+    if (mempool_id_.second > 0 &&
+        CUDACachingAllocator::getPoolUseCount(capture_dev_, mempool_id_) == 1) {
+      // TODO: empty cache here. Just make sure that MemPool hasn't
+      // been deleted already...  Unfortunately, it would have been
+      // already in this case. Ugh. Do things the more expensive way by doing
+      // emptyCache() with no active memory pool.
+      c10::cuda::MemPoolContext ctx(nullptr);
+      c10::cuda::CUDACachingAllocator::emptyCache();
+    }
   }
   if (has_graph_) {
     C10_CUDA_CHECK_WARN(cudaGraphDestroy(graph_));
@@ -595,6 +625,10 @@ void CUDAGraph::end_capture_to_conditional_node() {
 
   c10::cuda::CUDACachingAllocator::endAllocateToPool(capture_dev_, mempool_id_);
   if (conditional_graph_capture_streams_ids_.empty()) {
+    // I feel like I need to swap this out? It should use the current allocator right?
+// this calls get()->beginAllocateToPool() in CUDACachingAllocator.h
+    // which returns a CUDAAllocator*, which returns std::atomic<CUDAAllocator*> allocator in CUDACachingAllocator.cpp.
+    // so how is that set? Is it ever set to a pluggable allocator?
     c10::cuda::CUDACachingAllocator::beginAllocateToPool(
         capture_dev_, mempool_id_, create_allocate_filter());
   } else {
@@ -632,6 +666,66 @@ std::function<bool(cudaStream_t)> CUDAGraph::create_child_allocate_filter() {
   return std::function<bool(cudaStream_t)>();
 #endif
 }
+
+constexpr size_t TWO_MIB = 2 * 1024 * 1024; // 2 MiB in bytes
+
+size_t roundUpToNearestTwoMiB(size_t size) {
+    return ((size + TWO_MIB - 1) / TWO_MIB) * TWO_MIB;
+}
+
+void* cudagraph_malloc(size_t size, int device, cudaStream_t stream) {
+  std::cout << "GALVEZ:cudagraph_malloc" << std::endl;
+  at::cuda::OptionalCUDAGuard gpuGuard(device);
+  void *ptr;
+  size_t size_rounded_up_to_page = roundUpToNearestTwoMiB(size);
+  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemAddressReserve_((CUdeviceptr*)&ptr, size_rounded_up_to_page, 0ULL, 0, 0ULL));
+  // I need to maintain a hashtable mapping pointers to handles.
+  CUmemGenericAllocationHandle handle{};
+  CUmemAllocationProp prop{};
+  prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+  prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  prop.location.id = device;
+  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemCreate_(&handle, size_rounded_up_to_page, &prop, 0ULL));
+
+  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemMap_((CUdeviceptr)ptr, size_rounded_up_to_page, 0, handle, 0ULL));
+
+  CUmemAccessDesc desc{};
+  desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+  // NOLINTNEXTLINE(bugprone-signed-char-misuse)
+  desc.location.id = device;
+  desc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemSetAccess_((CUdeviceptr)ptr, size_rounded_up_to_page /* can I use size? */, &desc, 1));
+  // the trouble with this strategy is that
+  return ptr;
+}
+
+void cudagraph_free(void *ptr, size_t size, int device, cudaStream_t stream) {
+  std::cout << "GALVEZ:cudagraph_free" << std::endl;
+  at::cuda::OptionalCUDAGuard gpuGuard(device);
+  size_t size_rounded_up_to_page = roundUpToNearestTwoMiB(size);
+  CUmemGenericAllocationHandle handle{};
+  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemRetainAllocationHandle_(&handle, ptr)); // not a CUdeviceptr here!
+  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemUnmap_((CUdeviceptr)ptr, size_rounded_up_to_page));
+  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemRelease_(handle));
+  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemRelease_(handle));
+  C10_CUDA_DRIVER_CHECK(c10::cuda::DriverAPI::get()->cuMemAddressFree_((CUdeviceptr)ptr, size_rounded_up_to_page));
+}
+
+// Create a `CUDAPluggableAllocator` that uses the above functions.
+std::shared_ptr<c10::Allocator> CUDAGraph::get_mem_allocator() {
+  C10_LOG_API_USAGE_ONCE("CUDAGraph.getMemAllocator");
+  // for some reason, deleting static makes this not work... Hmm...
+  static std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>
+    cudaGraphAllocator =
+    torch::cuda::CUDAPluggableAllocator::createCustomAllocator(
+              cudagraph_malloc, cudagraph_free);
+  // Need to wrap in std::call_once if we're using static
+  // cudaGraphAllocator->set_begin_allocate_to_pool()
+  // cudaGraphAllocator->set_end_allocate_to_pool()
+  
+  return cudaGraphAllocator;
+}
+
 
 
 } // namespace at::cuda

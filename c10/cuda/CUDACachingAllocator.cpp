@@ -819,9 +819,11 @@ class EventPool {
 
 // CUDA graphs helper
 struct PrivatePool {
-  PrivatePool()
+ // hmm...
+  PrivatePool(CUDAAllocator *allocator_)
       : large_blocks(/*small=*/false, this),
-        small_blocks(/*small=*/true, this) {}
+        small_blocks(/*small=*/true, this),
+        allocator(allocator_) {}
   PrivatePool(const PrivatePool&) = delete;
   PrivatePool(PrivatePool&&) = delete;
   PrivatePool& operator=(const PrivatePool&) = delete;
@@ -841,6 +843,7 @@ struct PrivatePool {
   // I'd rather not add more logic to it.
   BlockPool large_blocks;
   BlockPool small_blocks;
+  CUDAAllocator *allocator;
 };
 
 BlockState::BlockState(Block* block)
@@ -882,7 +885,9 @@ struct MempoolIdHash {
 
 cudaError_t allocPrimitive(void** ptr, size_t size, AllocParams& p) {
   auto active_pool = MemPoolContext::getActiveMemPool();
+  std::cout << "GALVEZ:allocPrimitive" << std::endl;
   if (active_pool && active_pool->allocator() && p.pool->owner_PrivatePool) {
+    std::cout << "GALVEZ:allocPrimitive" << p.pool->owner_PrivatePool << ", " << p.pool << std::endl;
     *ptr = active_pool->allocator()->raw_alloc(size);
     return *ptr ? cudaSuccess : cudaErrorMemoryAllocation;
   } else {
@@ -970,6 +975,9 @@ class RingBuffer {
 
 } // anonymous namespace
 } // namespace Native
+
+ska::flat_hash_map<MempoolId_t, CUDACachingAllocator::CUDAAllocator*, Native::MempoolIdHash> allocator_for_mempool;
+std::mutex allocator_for_mempool_mutex;
 
 static std::string reportProcessMemoryInfo(c10::DeviceIndex device) {
 #ifdef PYTORCH_C10_DRIVER_API_SUPPORTED
@@ -2215,7 +2223,10 @@ class DeviceCachingAllocator {
       // Make a new pool for CUDAGraph capture or torch.cuda.use_mem_pool
       // usage. use_count is initially 1, which means the pool is
       // being used since somebody called ensureExistsAndIncrefPool.
-      graph_pools.emplace(mempool_id, std::make_unique<PrivatePool>());
+      {
+        std::lock_guard<std::mutex> lock(allocator_for_mempool_mutex);
+        graph_pools.emplace(mempool_id, std::make_unique<PrivatePool>(allocator_for_mempool.at(mempool_id))); // use_count will be 1 by defalt
+      }
     } else {
       // mempool_id references an existing pool, which the current CUDAGraph
       // capture or torch.cuda.use_mem_pool will
@@ -2689,7 +2700,7 @@ class DeviceCachingAllocator {
   // can be expensive while holding the lock. Hence, we pass-in the lock to the
   // function to temporarily release the lock before cudaMalloc call and acquire
   // it back again after the call so that other threads dont get blocked.
-  bool alloc_block(
+  bool alloc_block( // DeviceCachingAllocator::alloc_block
       AllocParams& p,
       bool isRetry,
       const std::shared_ptr<GatheredContext>& ctx,
@@ -2933,16 +2944,15 @@ class DeviceCachingAllocator {
         context ? context : block->context_when_segment_allocated);
 
     auto* pool = block->pool;
-    auto active_pool = MemPoolContext::getActiveMemPool();
-    if (active_pool && active_pool->allocator() && pool->owner_PrivatePool) {
-      // Ensure that active_pool and pool are the same
-      auto pp = get_private_pool(active_pool->id());
-      TORCH_INTERNAL_ASSERT(pp == pool->owner_PrivatePool);
-
+    // std::cout << "GALVEZ:allocPrimitive" << p.pool->owner_PrivatePool << ", " << p.pool << std::endl;
+    std::cout << "GALVEZ:release_block()" << pool->owner_PrivatePool << ", " << pool << std::endl;
+    if (pool->owner_PrivatePool && pool->owner_PrivatePool->allocator) {
       // If there is an active mempool with a given allocator,
       // we use the given allocator's delete function.
-      active_pool->allocator()->raw_delete((void*)block->ptr);
+      pool->owner_PrivatePool->allocator->raw_delete((void*)block->ptr);
     } else {
+      // lol, does cudaFree() on memory allocated by cuMemCreate actually fork? Fishy...
+      std::cout << "GALVEZ:cudaFree() fallback" << std::endl;
       C10_CUDA_CHECK(cudaFree((void*)block->ptr));
     }
     total_allocated_memory -= block->size;
@@ -3961,6 +3971,7 @@ struct BackendStaticInitializer {
         }
       }
     }
+    // we want this one, right?
     return &Native::allocator;
   }
 
@@ -3970,8 +3981,10 @@ struct BackendStaticInitializer {
   }
 };
 
+// here it is!
 std::atomic<CUDAAllocator*> allocator;
 static BackendStaticInitializer backend_static_initializer;
+
 } // namespace cuda::CUDACachingAllocator
 } // namespace c10
 
@@ -3999,21 +4012,40 @@ MemPool::MemPool(
   } else {
     id_ = {uuid_++, 0};
   }
+  // lol, so the allocator is associated with a device here in a
+  // way...
   device_ = c10::cuda::current_device();
+
+  // don't bother with deleting this entry for now. Just leak it.
+  {
+    std::lock_guard<std::mutex> lock(CUDACachingAllocator::allocator_for_mempool_mutex);
+    CUDACachingAllocator::allocator_for_mempool[id_] = allocator_;
+  }
+
   CUDACachingAllocator::ensureExistsAndIncrefPool(device_, id_);
 }
 
 MemPool::~MemPool() {
-  TORCH_INTERNAL_ASSERT(use_count() == 1);
+  // Problem: this isn't necessarily true if a torch.cuda.CUDAGraph()
+  // is around and hasn't been deleted/reset. We need to figure out a
+  // solution here. We want to call emptyCache() only if use_count()
+  // == 1...
+  // to be fair, we don't *need* to call emptyCache() at this time. 
+  // But I suppose it is reasonable to do that.
+  // TORCH_INTERNAL_ASSERT(use_count() >= 1);
   CUDACachingAllocator::releasePool(device_, id_);
-  auto ctx = MemPoolContext(this);
-  c10::cuda::CUDACachingAllocator::emptyCache();
+  // lol what. Construct and destructor must do something then...
+  if (use_count() == 0) {
+    auto ctx = MemPoolContext(this);  // literally just sets active mempool so that correct one is emptied.
+    c10::cuda::CUDACachingAllocator::emptyCache();
+  }
 }
 
 MempoolId_t MemPool::id() {
   return id_;
 }
 
+// so is this what I should really be using?
 CUDACachingAllocator::CUDAAllocator* MemPool::allocator() {
   return allocator_;
 }
@@ -4037,6 +4069,9 @@ MempoolId_t MemPool::graph_pool_handle(bool is_user_created) {
 // and not inside MemPoolContext class, because in windows we
 // can't use __declspec(dllexport) and __declspec(thread)
 // together: https://stackoverflow.com/a/50967977
+
+// thread_local is very hard to deal with when stream caputre goes
+// across multiple threads, as it does during backprop by default.
 static thread_local MemPool* active_mempool_ = nullptr;
 
 MemPoolContext::MemPoolContext(MemPool* mempool)

@@ -1149,6 +1149,7 @@ static void registerCudaPluggableAllocator(PyObject* module) {
         torch::cuda::CUDAPluggableAllocator::changeCurrentAllocator(allocator);
       });
   py::class_<
+      // Right, so I need to create this one! Piece of cake! 
       torch::cuda::CUDAPluggableAllocator::CUDAPluggableAllocator,
       c10::cuda::CUDACachingAllocator::CUDAAllocator,
       std::shared_ptr<
@@ -1225,7 +1226,7 @@ static void registerCudaPluggableAllocator(PyObject* module) {
                 reinterpret_cast<FuncType*>(func_ptr);
             self.set_end_allocate_to_pool_fn(func);
           })
-      .def(
+      .def( // Do I use this?
           "set_release_pool",
           [](torch::cuda::CUDAPluggableAllocator::CUDAPluggableAllocator& self,
              uint64_t func_ptr) {

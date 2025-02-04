@@ -5281,6 +5281,7 @@ static void _ncclMemFree(void* ptr, size_t size, int device, void* stream) {
 #endif // NCCL_HAS_MEM_ALLOC
 }
 
+// Let's try this one
 // Create a `CUDAPluggableAllocator` that uses the above functions.
 std::shared_ptr<c10::Allocator> ProcessGroupNCCL::getMemAllocator() {
 #ifndef NCCL_HAS_MEM_ALLOC
@@ -5288,6 +5289,7 @@ std::shared_ptr<c10::Allocator> ProcessGroupNCCL::getMemAllocator() {
       false, "NCCL mem allocator is not supported in this NCCL version");
 #endif // NCCL_HAS_MEM_ALLOC
   C10_LOG_API_USAGE_ONCE("ProcessGroupNCCL.getMemAllocator");
+  // singleton, because static. Hmm...
   static std::shared_ptr<c10::cuda::CUDACachingAllocator::CUDAAllocator>
       ncclMemAllocator =
           torch::cuda::CUDAPluggableAllocator::createCustomAllocator(

@@ -112,5 +112,9 @@ void THCPGraph_init(PyObject* module) {
           torch::wrap_pybind_function_no_gil(
               &::at::cuda::CUDAGraph::set_conditional_handle),
           py::arg("handle"),
-          py::arg("scalar_cuda_pred_tensor"));
+          py::arg("scalar_cuda_pred_tensor"))
+      .def_static(
+          "get_mem_allocator",
+          torch::wrap_pybind_function_no_gil(
+              &::at::cuda::CUDAGraph::get_mem_allocator));
 }

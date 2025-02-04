@@ -25,6 +25,7 @@
   _(cuMemMap)                       \
   _(cuMemAddressFree)               \
   _(cuMemSetAccess)                 \
+  _(cuMemRetainAllocationHandle)    \
   _(cuMemUnmap)                     \
   _(cuMemCreate)                    \
   _(cuMemGetAllocationGranularity)  \
