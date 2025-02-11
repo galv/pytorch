@@ -1,3 +1,4 @@
+#include <ATen/cuda/CachingHostAllocator.h>
 #include <ATen/cuda/CUDAGeneratorImpl.h>
 #include <ATen/cuda/CUDAGraph.h>
 #include <ATen/cuda/Exceptions.h>
@@ -110,6 +111,13 @@ void CUDAGraph::capture_begin(MempoolId_t pool/*=0*/, cudaStreamCaptureMode capt
   // https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html#group__CUDART__STREAM_1g9d0535d93a214cbf126835257b16ba85
   AT_CUDA_CHECK(cudaStreamBeginCapture(capture_stream_, capture_mode));
 
+  at::cuda::getCUDAStreamCapturableCachingHostAllocator()->begin_allocate_to_pool(mempool_id_, [this](c10::Stream stream) {
+      cudaStreamCaptureStatus status{};
+      CaptureId_t stream_capture_id = 0;
+      AT_CUDA_CHECK(cudaStreamGetCaptureInfo(CUDAStream(stream), &status, &stream_capture_id));
+      return status == cudaStreamCaptureStatus::cudaStreamCaptureStatusActive && stream_capture_id == capture_id_;
+  });
+
   cudaStreamCaptureStatus status{};
   AT_CUDA_CHECK(cudaStreamGetCaptureInfo(stream, &status, &capture_id_));
   TORCH_INTERNAL_ASSERT(status == cudaStreamCaptureStatus::cudaStreamCaptureStatusActive);
@@ -121,6 +129,9 @@ void CUDAGraph::capture_end() {
 
   TORCH_CHECK(stream == capture_stream_,
               "Capture must end on the same stream it began on.");
+
+  // calling this before cudaStreamEndCapture is important
+  at::cuda::getCUDAStreamCapturableCachingHostAllocator()->end_allocate_to_pool(mempool_id_);
 
   AT_CUDA_CHECK(cudaStreamEndCapture(capture_stream_, &graph_));
 
@@ -276,6 +287,7 @@ void CUDAGraph::reset() {
   if (capture_ended_) {
     // notifyCaptureDestroy may throw. How should we handle this?
     c10::cuda::CUDACachingAllocator::releasePool(capture_dev_, mempool_id_);
+    at::cuda::getCUDAStreamCapturableCachingHostAllocator()->release_pool(mempool_id_);
     capture_ended_ = false;
   }
   if (has_graph_) {
