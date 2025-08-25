@@ -652,6 +652,14 @@ struct TORCH_API HostAllocator : public at::Allocator {
 
   // Resets the peak memory usage metrics
   virtual void reset_peak_stats() = 0;
+
+  virtual void begin_allocate_to_pool(
+      c10::MempoolId_t pool_id,
+      std::function<bool(c10::Stream)> filter) {     TORCH_CHECK_NOT_IMPLEMENTED(false, "Not implemented for copy_data"); }
+
+  virtual void end_allocate_to_pool(c10::MempoolId_t pool_id) {     TORCH_CHECK_NOT_IMPLEMENTED(false, "Not implemented for copy_data"); }
+
+  virtual void release_pool(c10::MempoolId_t pool_id) {     TORCH_CHECK_NOT_IMPLEMENTED(false, "Not implemented for copy_data"); }
 };
 
 template <typename T, c10::DeleterFnPtr deleteFunc>

@@ -980,12 +980,6 @@ PrivatePoolState::PrivatePoolState(
   }
 }
 
-struct MempoolIdHash {
-  std::size_t operator()(const MempoolId_t& mempool_id) const noexcept {
-    return mempool_id.first != 0 ? mempool_id.first : mempool_id.second;
-  }
-};
-
 cudaError_t allocPrimitive(void** ptr, size_t size, AllocParams& p) {
   if (p.pool->owner_PrivatePool && p.pool->owner_PrivatePool->allocator()) {
     *ptr = p.pool->owner_PrivatePool->allocator()->raw_alloc(size);
@@ -1753,6 +1747,7 @@ class DeviceCachingAllocator {
   }
 
   /** returns cached blocks to the system allocator **/
+  // this is called by THCPModule_emptyCache, with no argument
   void emptyCache(MempoolId_t mempool_id) {
     auto context = maybeGatherContext(RecordContext::ALL);
     std::lock_guard<std::recursive_mutex> lock(mutex);
@@ -3007,7 +3002,8 @@ class DeviceCachingAllocator {
 
     for (auto it = graph_pools_freeable.begin();
          it != graph_pools_freeable.end();) {
-      if (mempool_id.first != 0 || mempool_id.second != 0) {
+      if (! (mempool_id.first == 0 && mempool_id.second == 0)) {
+      // if (mempool_id.first != 0 || mempool_id.second != 0) {
         if (it->first == mempool_id) {
           // If there is an active mempool, we sync only the events
           // associated with the pool

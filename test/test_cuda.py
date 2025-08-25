@@ -5224,6 +5224,314 @@ class TestBlockStateAbsorption(TestCase):
 
 
 @unittest.skipIf(not TEST_CUDA, "CUDA not available, skipping tests")
+class TestGraphPinMemory(TestCase):
+    def test_two_graphs(self):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+            data = torch.randn(8).pin_memory()
+            data_gpu = torch.randn(8, device="cuda")
+            data_gpu.copy_(data, non_blocking=True)
+            old_data_ptr = data.data_ptr()
+            del data
+            data2 = torch.randn(8).pin_memory()
+        assert data2.data_ptr() == old_data_ptr
+
+        old_data2_ptr = data2.data_ptr()
+
+        del data2
+
+        graph2 = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(
+            graph2, capture_error_mode="thread_local", pool=graph.pool()
+        ):
+            data3 = torch.randn(8).pin_memory()
+            data_gpu = torch.randn(8, device="cuda")
+            data_gpu.copy_(data3, non_blocking=True)
+            old_data3_ptr = data3.data_ptr()
+            del data3
+            data4 = torch.randn(8).pin_memory()
+        assert data4.data_ptr() == old_data3_ptr
+        old_data4_ptr = data4.data_ptr()
+
+        assert old_data_ptr == old_data2_ptr == old_data3_ptr == old_data4_ptr
+
+    def test_pin_memory_no_free(self):
+        pass
+
+    def test_pin_memory_no_use(self):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+            data = torch.empty(8, pin_memory=True)
+            data2 = torch.empty(8, pin_memory=True)
+        assert data.data_ptr() != data2.data_ptr()
+        del data2
+
+    def test_pin_memory_use1(self):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+            data = torch.randn(8).pin_memory()
+            data_gpu = torch.randn(8, device="cuda")
+            data_gpu.copy_(data, non_blocking=True)
+            old_data_ptr = data.data_ptr()
+            del data
+            data2 = torch.randn(8).pin_memory()
+        assert data2.data_ptr() == old_data_ptr
+
+    def test_pin_memory_use2(self):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+            data = torch.randn(8).pin_memory()
+            data_gpu = torch.randn(8, device="cuda")
+            data_gpu.copy_(data, non_blocking=True)
+            del data
+        # graph.reset()
+
+    def test_pin_memory_joined_stream(self):
+        graph = torch.cuda.CUDAGraph()
+
+        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+            data = torch.randn(8).pin_memory()
+            data_gpu = torch.randn(8, device="cuda")
+
+            s2 = torch.cuda.Stream()
+            s2.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s2):
+                data_gpu.copy_(data, non_blocking=True)
+            torch.cuda.current_stream().wait_stream(s2)
+            # This *should* free my allocation!
+            old_data_ptr = data.data_ptr()
+            del data
+            data2 = torch.randn(8).pin_memory()
+        assert data2.data_ptr() == old_data_ptr
+
+    def test_pin_memory_unjoined_stream(self):
+        graph = torch.cuda.CUDAGraph()
+
+        with torch.cuda.graph(graph, capture_error_mode="global"):
+            data = torch.randn(8).pin_memory()
+            data_gpu = torch.randn(8, device="cuda")
+
+            s2 = torch.cuda.Stream()
+            s2.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s2):
+                data_gpu.copy_(data, non_blocking=True)
+            # This should *not* free my allocation!
+            old_data_ptr = data.data_ptr()
+            del data
+            data2 = torch.randn(8).pin_memory()
+            torch.cuda.current_stream().wait_stream(s2)
+        assert data2.data_ptr() != old_data_ptr
+
+    def test_pin_memory_multiple_graphs_same_mem_pool_no_live_output(self):
+        shared_pool = torch.cuda.graph_pool_handle()
+        graph1 = torch.cuda.CUDAGraph()
+        graph2 = torch.cuda.CUDAGraph()
+
+        with torch.cuda.graph(
+            graph1, pool=shared_pool, capture_error_mode="thread_local"
+        ):
+            data = torch.randn(8).pin_memory()
+            data_gpu = torch.randn(8, device="cuda")
+            data_gpu.copy_(data, non_blocking=True)
+
+            old_data_ptr = data.data_ptr()
+            del data
+
+        with torch.cuda.graph(
+            graph2, pool=shared_pool, capture_error_mode="thread_local"
+        ):
+            data2 = torch.randn(8).pin_memory()
+            data_gpu = torch.randn(8, device="cuda")
+            data_gpu.copy_(data2, non_blocking=True)
+
+            new_data_ptr = data2.data_ptr()
+            del data2
+
+        assert new_data_ptr == old_data_ptr
+
+    def test_pin_memory_multiple_graphs_same_mem_pool_live_output(self):
+        shared_pool = torch.cuda.graph_pool_handle()
+        graph1 = torch.cuda.CUDAGraph()
+        graph2 = torch.cuda.CUDAGraph()
+
+        with torch.cuda.graph(
+            graph1, pool=shared_pool, capture_error_mode="thread_local"
+        ):
+            data = torch.randn(8).pin_memory()
+            data_gpu = torch.randn(8, device="cuda")
+            data_gpu.copy_(data, non_blocking=True)
+
+            old_data_ptr = data.data_ptr()
+
+        with torch.cuda.graph(
+            graph2, pool=shared_pool, capture_error_mode="thread_local"
+        ):
+            data2 = torch.randn(8).pin_memory()
+            data_gpu = torch.randn(8, device="cuda")
+            data_gpu.copy_(data2, non_blocking=True)
+
+            new_data_ptr = data2.data_ptr()
+
+        assert new_data_ptr != old_data_ptr
+
+@unittest.skipIf(not TEST_CUDA, "CUDA not available, skipping tests")
+class TestPinMemoryPrivatePool(TestCase):
+    def test_basic(self):
+        pool1 = torch.cuda.MemPool()
+        with torch.cuda.memory.use_mem_pool(pool1):
+            data = torch.randn(8).pin_memory()
+        del data
+
+    def test_basic2(self):
+        pool1 = torch.cuda.MemPool()
+        with torch.cuda.memory.use_mem_pool(pool1):
+            data = torch.randn(8).pin_memory()
+            del data
+
+    def test_empty_allocation(self):
+        pool1 = torch.cuda.MemPool()
+        with torch.cuda.memory.use_mem_pool(pool1):
+            data = torch.empty(()).pin_memory()
+            print("GALVEZ:", data.data_ptr())
+        del data
+
+    def test_two_pools(self):
+        pool1 = torch.cuda.MemPool()
+        print("GALVEZ:id=", pool1.id)
+        with torch.cuda.memory.use_mem_pool(pool1):
+            data = torch.empty(8, pin_memory=True)
+            data_gpu = torch.randn(8, device="cuda")
+            data_gpu.copy_(data, non_blocking=True)
+            old_data_ptr = data.data_ptr()
+            del data
+            # necessary to make sure that event query during pin_memory() will always succeed
+            torch.cuda.current_stream().synchronize()
+            data2 = torch.empty(8, pin_memory=True)
+            old_data2_ptr = data2.data_ptr()
+            del data2
+        assert old_data2_ptr == old_data_ptr, f"{hex(data2.data_ptr())=} {hex(old_data_ptr)=}"
+
+        pool2 = torch.cuda.MemPool()
+        with torch.cuda.memory.use_mem_pool(pool1):
+            data3 = torch.randn(8).pin_memory()
+            data_gpu = torch.randn(8, device="cuda")
+            data_gpu.copy_(data3, non_blocking=True)
+            old_data3_ptr = data3.data_ptr()
+            del data3
+            # necessary to make sure that event query during pin_memory() will always succeed
+            torch.cuda.current_stream().synchronize()
+            data4 = torch.randn(8).pin_memory()
+        assert data4.data_ptr() == old_data3_ptr
+        old_data4_ptr = data4.data_ptr()
+
+        assert old_data_ptr == old_data2_ptr == old_data3_ptr == old_data4_ptr
+
+    def test_pin_memory_no_use(self):
+        pool = torch.cuda.MemPool()
+        with torch.cuda.memory.use_mem_pool(pool):
+            data = torch.empty(8, pin_memory=True)
+            data2 = torch.empty(8, pin_memory=True)
+        assert data.data_ptr() != data2.data_ptr()
+
+    def test_pin_memory_use1(self):
+        pool = torch.cuda.MemPool()
+        with torch.cuda.memory.use_mem_pool(pool):
+            data = torch.randn(8).pin_memory()
+            data_gpu = torch.randn(8, device="cuda")
+            data_gpu.copy_(data, non_blocking=True)
+            old_data_ptr = data.data_ptr()
+            del data
+            # necessary to make sure that event query during pin_memory() will always succeed
+            torch.cuda.current_stream().synchronize()
+            data2 = torch.randn(8).pin_memory()
+        assert data2.data_ptr() == old_data_ptr
+
+    def test_pin_memory_use2(self):
+        pool = torch.cuda.MemPool()
+        with torch.cuda.memory.use_mem_pool(pool):
+            data = torch.randn(8).pin_memory()
+            data_gpu = torch.randn(8, device="cuda")
+            data_gpu.copy_(data, non_blocking=True)
+            del data
+
+    def test_pin_memory_joined_stream(self):
+        pool = torch.cuda.MemPool()
+        with torch.cuda.memory.use_mem_pool(pool):
+            data = torch.randn(8).pin_memory()
+            data_gpu = torch.randn(8, device="cuda")
+
+            s2 = torch.cuda.Stream()
+            s2.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s2):
+                data_gpu.copy_(data, non_blocking=True)
+                # necessary to make sure that event query during pin_memory() will always succeed
+                torch.cuda.current_stream().synchronize()
+            old_data_ptr = data.data_ptr()
+            del data
+            data2 = torch.randn(8).pin_memory()
+        assert data2.data_ptr() == old_data_ptr
+
+    def test_pin_memory_multiple_context_same_mem_pool_no_live_output(self):
+        shared_pool = torch.cuda.MemPool()
+
+        with torch.cuda.memory.use_mem_pool(shared_pool):
+            data = torch.randn(8).pin_memory()
+            data_gpu = torch.randn(8, device="cuda")
+            data_gpu.copy_(data, non_blocking=True)
+
+            old_data_ptr = data.data_ptr()
+            del data
+
+        # necessary to make sure that event query during pin_memory() will always succeed
+        torch.cuda.current_stream().synchronize()
+
+        with torch.cuda.memory.use_mem_pool(shared_pool):
+            data2 = torch.randn(8).pin_memory()
+            data_gpu = torch.randn(8, device="cuda")
+            data_gpu.copy_(data2, non_blocking=True)
+
+            new_data_ptr = data2.data_ptr()
+            del data2
+
+        assert new_data_ptr == old_data_ptr
+
+    def test_pin_memory_multiple_graphs_same_mem_pool_live_output(self):
+        shared_pool = torch.cuda.MemPool()
+
+        with torch.cuda.memory.use_mem_pool(shared_pool):
+            data = torch.randn(8).pin_memory()
+            data_gpu = torch.randn(8, device="cuda")
+            data_gpu.copy_(data, non_blocking=True)
+
+            old_data_ptr = data.data_ptr()
+
+        with torch.cuda.memory.use_mem_pool(shared_pool):
+            data2 = torch.randn(8).pin_memory()
+            data_gpu = torch.randn(8, device="cuda")
+            data_gpu.copy_(data2, non_blocking=True)
+
+            new_data_ptr = data2.data_ptr()
+
+        assert new_data_ptr != old_data_ptr
+
+    def test_pin_memory_nested_pools(self):
+        # When nesting `with torch.cuda.memory.use_mem_pool`, I would
+        # like to guarantee that allocations go to the right pool.
+        pool1 = torch.cuda.MemPool()
+        pool2 = torch.cuda.MemPool()
+        with torch.cuda.memory.use_mem_pool(pool1):
+            data1 = torch.randn(8).pin_memory()
+            with torch.cuda.memory.use_mem_pool(pool2):
+                data2 = torch.randn(8).pin_memory()
+        # these API's don't exist right now
+        # pool1_segments = torch.cuda.memory.memory_snapshot(pool1.id)
+        # pool2_segments = torch.cuda.memory.memory_snapshot(pool2.id)
+
+        # assert len(pool1_segments) == 1
+        # assert len(pool2_segments) == 1
+
+
+@unittest.skipIf(not TEST_CUDA, "CUDA not available, skipping tests")
 class TestMemPool(TestCase):
     def _setup_mempool_limited_memory_test(self, additional_allowed_memory_in_mb):
         device = torch.device("cuda:0")

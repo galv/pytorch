@@ -67,10 +67,27 @@ class EventPool {
   std::vector<PerDevicePool> pools_;
 };
 
-using Block = HostBlock<CUDAStream>;
+// forward declare
+struct CUDACachingHostAllocatorImpl;
+
+struct CUDACachingHostAllocatorImplBlock {
+  CUDACachingHostAllocatorImplBlock(size_t size, void* ptr, std::shared_ptr<CUDACachingHostAllocatorImpl> pool_ptr) : size_(size), ptr_(ptr), pool_ptr_(std::move(pool_ptr)) {}
+
+  std::mutex mutex_;
+  size_t size_{0}; // block size in bytes
+  void* ptr_{nullptr}; // memory address
+  bool allocated_{false}; // in-use flag
+  size_t event_count_{0}; // number of related events
+  ska::flat_hash_set<CUDAStream> streams_; // streams on which the block was used
+  std::shared_ptr<CUDACachingHostAllocatorImpl> pool_ptr_;
+};
 
 struct CUDACachingHostAllocatorImpl
-    : public CachingHostAllocatorImpl<CUDAStream, EventPool::Event> {
+  : public CachingHostAllocatorImpl<CUDAStream, EventPool::Event, CUDACachingHostAllocatorImplBlock, CUDACachingHostAllocatorImpl> {
+  using Block = CUDACachingHostAllocatorImplBlock;
+
+  explicit CUDACachingHostAllocatorImpl(): CachingHostAllocatorImpl<CUDAStream, EventPool::Event, CUDACachingHostAllocatorImplBlock, CUDACachingHostAllocatorImpl>() {}
+
  private:
   std::unordered_map<void*, bool> use_host_register;
 
@@ -254,13 +271,16 @@ struct CUDACachingHostAllocatorImpl
   }
 };
 
-DECLARE_HOST_ALLOCATOR(
-    CUDACachingHostAllocator,
-    CUDACachingHostAllocatorImpl,
-    raw_local_deleter,
-    caching_host_allocator)
+} // anonymous namespace
+
+
+void raw_local_deleter(void* ptr);
+struct CUDACachingHostAllocator final
+  : public at::cuda::CachingHostAllocatorInterface<CUDACachingHostAllocatorImpl, raw_local_deleter> {};
+static CUDACachingHostAllocator caching_host_allocator;
+void raw_local_deleter(void* ptr) {
+  caching_host_allocator.free(ptr);
+}
 
 REGISTER_HOST_ALLOCATOR(at::kCUDA, &caching_host_allocator)
-
-} // anonymous namespace
 } // namespace at::cuda
